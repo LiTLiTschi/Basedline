@@ -1,866 +1,1421 @@
-# MIK Automation Plan: Headless DB Injection Pipeline
+# MIK Automation Plan
 
-> **Author**: Perplexity AI agent, commissioned by LiTLiTschi, 2026-03-08 03:27 CET  
-> **Status**: Planning phase — ready for implementation  
-> **Goal**: Automatically inject new audio files from a Raspberry Pi server into Mixed In Key 11's SQLite database as unanalyzed entries, triggering hands-free cloud analysis without any GUI interaction.
+> **Status:** Draft — written 2026-03-08 by automation agent while Liu slept.  
+> **Scope:** Fully hands-free Mixed In Key 11 analysis on Raspberry Pi (Wine), triggered by new files appearing on disk. No GUI interaction required at any point.
 
 ---
 
 ## Table of Contents
 
-1. [Architecture Overview](#1-architecture-overview)
-2. [Assumptions & Verified Facts](#2-assumptions--verified-facts)
-3. [Component Specs](#3-component-specs)
-   - [3.1 Raspi File Watcher](#31-raspi-file-watcher-watcherd-or-inotifywait)
-   - [3.2 Queue File Writer (Raspi)](#32-queue-file-writer-raspi)
-   - [3.3 DB Queue Injector (Windows)](#33-db-queue-injector-windows--mik_queue_injectpy)
-   - [3.4 MIK Restart Trigger (Windows)](#34-mik-restart-trigger-windows)
-   - [3.5 Post-Analysis Tag Writeback](#35-post-analysis-tag-writeback--mik_writeback_tagspy)
-4. [Minimal Viable INSERT Statement](#4-minimal-viable-insert-statement)
-5. [FilePathHash Reverse Engineering](#5-filepathhash-reverse-engineering)
-6. [Path Translation](#6-path-translation-linuxraspi--windows)
-7. [DB Access Strategy & Concurrency Safety](#7-db-access-strategy--concurrency-safety)
-8. [SongCollectionMembership Handling](#8-songcollectionmembership-handling)
-9. [Implementation Order](#9-implementation-order)
-10. [Testing Strategy](#10-testing-strategy)
-11. [Known Unknowns & Risks](#11-known-unknowns--risks)
-12. [Config File Schema](#12-config-file-schema)
-13. [Full Data Flow Diagram](#13-full-data-flow-diagram)
+1. [Core Mechanism](#1-core-mechanism)
+2. [Architecture Overview](#2-architecture-overview)
+3. [Path Translation: Linux ↔ Wine](#3-path-translation-linux--wine)
+4. [FilePathHash: Algorithm Discovery](#4-filepathhash-algorithm-discovery)
+5. [Component: mik_queue_insert.py](#5-component-mik_queue_insertpy)
+6. [Component: mik_watcher_daemon.py](#6-component-mik_watcher_daemonpy)
+7. [Component: mik_process_manager.py](#7-component-mik_process_managerpy)
+8. [Configuration: config.json](#8-configuration-configjson)
+9. [Systemd Service Files](#9-systemd-service-files)
+10. [Testing Procedure](#10-testing-procedure)
+11. [Batch Backfill: Queuing an Entire Directory](#11-batch-backfill-queuing-an-entire-directory)
+12. [Known Limitations and Risks](#12-known-limitations-and-risks)
+13. [Open Questions for Liu](#13-open-questions-for-liu)
 
 ---
 
-## 1. Architecture Overview
+## 1. Core Mechanism
 
-The system is split into two sides that communicate via a shared folder (SMB or any network filesystem):
+Mixed In Key 11 reads `MIKStore.db` on startup and queues **all `Song` rows where `IsAnalyzed = 0`** for cloud analysis. This is the entire automation trigger:
 
 ```
-RASPBERRY PI (server)          SHARED FOLDER          WINDOWS MACHINE
-─────────────────────          ─────────────          ──────────────────────────
-inotifywait / watchdog  ──→   queue.txt       ──→    mik_queue_inject.py
-                                                      (Windows Task Scheduler,
-                                                       every 5 min)
-                                                             │
-                                                             ▼
-                                                      MIKStore.db  ←── MIK.exe
-                                                      (INSERT unanalyzed rows)
-                                                             │
-                                                       MIK analyzes
-                                                       via cloud API
-                                                             │
-                               results.jsonl   ←───  mik_writeback_tags.py
-                                   │                  (polls DB, detects newly
-                                   ▼                   analyzed rows)
-                        mik_tag_writer.py (Raspi)
-                        writes KEY/BPM/Energy to
-                        audio file tags via mutagen
+IsAnalyzed = 0  →  MIK queues track for analysis on next startup
+IsAnalyzed = 1  →  MIK skips the track (already done)
 ```
 
-**Why Windows-side injection?** SQLite over SMB is unreliable and prone to corruption, especially when MIK is running concurrently. The queue-file approach means the Raspi only writes a plain text file over the network share — safe and atomic. All DB writes happen locally on the Windows machine.
+This means we never need to touch MIK's GUI. The full loop is:
+
+```
+[new file on disk]
+      ↓
+[mik_queue_insert.py: INSERT Song row with IsAnalyzed=0]
+      ↓
+[MIK process restarted]
+      ↓
+[MIK reads DB, sees IsAnalyzed=0, calls cloud analysis API]
+      ↓
+[MIK writes Key/BPM/Energy back to Song row + audio file tags]
+      ↓
+[IsAnalyzed = 1, Comment = "02A - 155 - 7"]
+```
+
+**Evidence base:**
+- `Song.IsAnalyzed` column confirmed in DB schema (README, LiTLiTschi/Basedline)
+- All analyzed tracks in a 123k library have `IsAnalyzed = 1`
+- `LastAnalyzedUtc` is NULL on unanalyzed rows
+- MIK confirmed to be cloud-only analysis (no local processing)
 
 ---
 
-## 2. Assumptions & Verified Facts
+## 2. Architecture Overview
 
-| # | Statement | Source | Confidence |
-|---|-----------|--------|------------|
-| 1 | MIK 11 uses SQLite 3 at `%LOCALAPPDATA%\Mixed In Key\Mixed In Key\11.0\MIKStore.db` | LiTLiTschi DB analysis (README) | ✅ Verified |
-| 2 | `Song.IsAnalyzed = 0` marks a track for analysis; MIK picks these up at startup | LiTLiTschi assumption, logical | ⚠️ High confidence, needs 1x test |
-| 3 | `Song` table uses `WITHOUT ROWID` with UUID v4 TEXT primary keys | LiTLiTschi DB analysis | ✅ Verified |
-| 4 | `SongSegment` and `SerializedSongStructure` are **outputs** of analysis, not required inputs | Inferred from data (they contain key/energy results) | ⚠️ Likely — test: does MIK crash or skip tracks with no pre-existing SongSegment row? |
-| 5 | `SongCollectionMembership` with `MIKRoot` collection required for track to appear in MIK UI | Inferred from Collection table structure | ⚠️ Likely — test: does MIK show injected tracks without SCM row? |
-| 6 | MIK performs analysis via cloud API (internet required) | Creator confirmed 2016; still true in v11 | ✅ Verified |
-| 7 | MIK runs on Windows only (no Linux support) | Official system requirements | ✅ Verified |
-| 8 | `FilePathHash` algorithm is unknown | Not documented anywhere | ❓ Needs empirical testing (see §5) |
-| 9 | `SecondKey = '-1A'` is the correct sentinel for "no secondary key" | LiTLiTschi DB analysis (observed in all rows) | ✅ Verified |
-| 10 | `DiskLabel` and `DiskSerialNumber` refer to the Windows volume where music is stored | LiTLiTschi DB analysis | ✅ Verified — needed for INSERT |
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                        Raspberry Pi                             │
+│                                                                 │
+│  ┌──────────────────────────────────┐                          │
+│  │  mik_watcher_daemon.py           │                          │
+│  │  (systemd service: mik-watcher)  │                          │
+│  │                                  │                          │
+│  │  watchdog / inotify watching     │                          │
+│  │  MUSIC_DIR for new .mp3/.flac/   │                          │
+│  │  .m4a/.wav/.aiff files           │                          │
+│  └──────────────┬───────────────────┘                          │
+│                 │ new file event                               │
+│                 ▼                                               │
+│  ┌──────────────────────────────────┐                          │
+│  │  mik_queue_insert.py             │                          │
+│  │                                  │                          │
+│  │  1. Read audio metadata (mutagen)│                          │
+│  │  2. Translate Linux→Wine path    │                          │
+│  │  3. Compute FilePathHash         │                          │
+│  │  4. Check: already in DB?        │                          │
+│  │  5. INSERT into Song             │                          │
+│  │  6. INSERT into                  │                          │
+│  │     SongCollectionMembership     │                          │
+│  │  7. Signal mik_process_manager   │                          │
+│  └──────────────┬───────────────────┘                          │
+│                 │                                               │
+│                 ▼                                               │
+│  ┌──────────────────────────────────┐                          │
+│  │  mik_process_manager.py          │                          │
+│  │  (systemd service: mik-process)  │                          │
+│  │                                  │                          │
+│  │  Debounced: waits N seconds for  │                          │
+│  │  more files before restart       │                          │
+│  │  1. SIGTERM to MIK Wine process  │                          │
+│  │  2. Wait for wineserver to quit  │                          │
+│  │  3. Start Xvfb if not running    │                          │
+│  │  4. wine MixedInKey.exe (headless│                          │
+│  │  5. Monitor until queue empty    │                          │
+│  └──────────────┬───────────────────┘                          │
+│                 │                                               │
+│  ┌──────────────▼───────────────────┐                          │
+│  │  Wine + MIK 11.exe               │                          │
+│  │  (DISPLAY=:99 via Xvfb)          │                          │
+│  │                                  │                          │
+│  │  MIKStore.db (local Wine prefix) │                          │
+│  │  ~/.wine/drive_c/users/Liu/      │                          │
+│  │  AppData/Local/Mixed In Key/     │                          │
+│  │  Mixed In Key/11.0/MIKStore.db   │                          │
+│  └──────────────────────────────────┘                          │
+│                                                                 │
+│  Music SSD: /mnt/music/  (also Wine drive H:\)                 │
+└─────────────────────────────────────────────────────────────────┘
+```
 
 ---
 
-## 3. Component Specs
+## 3. Path Translation: Linux ↔ Wine
 
-### 3.1 Raspi File Watcher (`watcherd` or `inotifywait`)
+MIK stores **Windows-style paths** in the `Song.File` column (e.g., `H:\music\track.mp3`).  
+The Raspi sees the same files at a Linux path (e.g., `/mnt/music/track.mp3`).
 
-**Purpose**: Detect new audio files arriving on the Raspi and trigger the queue append.
+Wine maps drives to directories in `~/.wine/dosdevices/`:
+- `~/.wine/dosdevices/h:` → symlink to `/mnt/music` (or wherever the SMB share is mounted)
 
-**Implementation**: systemd service running a Python `watchdog` observer, or a shell script using `inotifywait`.
-
-**Shell approach (simple, no deps):**
-
+If the drive mapping doesn't exist yet, create it:
 ```bash
-#!/usr/bin/env bash
-# /usr/local/bin/mik-watcher.sh
-MUSIC_DIR="/mnt/music"
-QUEUE_FILE="/mnt/shared/mik_queue.txt"
-LOCK_FILE="/tmp/mik_queue.lock"
-EXTENSIONS="mp3|flac|m4a|wav|aiff|aif"
-
-inotifywait -m -r -e close_write --format '%w%f' \
-  --include ".*\\.($EXTENSIONS)$" "$MUSIC_DIR" | while read filepath; do
-    flock "$LOCK_FILE" echo "$filepath" >> "$QUEUE_FILE"
-    echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] Queued: $filepath"
-done
+mkdir -p ~/.wine/dosdevices
+ln -s /mnt/music ~/.wine/dosdevices/h:
 ```
 
-**Python approach (recommended, integrates with Basedline):**
+Path translation is a two-step normalization:
 
 ```python
-# mik_watcher.py (runs on Raspi)
-from watchdog.observers import Observer
-from watchdog.events import FileSystemEventHandler
-import fcntl, os, time
-
-AUDIO_EXTENSIONS = {'.mp3', '.flac', '.m4a', '.wav', '.aiff', '.aif'}
-QUEUE_FILE = "/mnt/shared/mik_queue.txt"
-
-class AudioHandler(FileSystemEventHandler):
-    def on_closed(self, event):  # watchdog >= 2.1 has on_closed
-        if not event.is_directory:
-            ext = os.path.splitext(event.src_path)[1].lower()
-            if ext in AUDIO_EXTENSIONS:
-                self._append_queue(event.src_path)
-
-    def _append_queue(self, path):
-        with open(QUEUE_FILE, 'a') as f:
-            fcntl.flock(f, fcntl.LOCK_EX)
-            f.write(path + '\n')
-            fcntl.flock(f, fcntl.LOCK_UN)
+def linux_to_wine_path(linux_path: str, config: dict) -> str:
+    """
+    Convert a Linux path to the Wine Windows path that MIK will store.
+    config example:
+        {"path_map": {"/mnt/music": "H:\\music"}}
+    """
+    for linux_prefix, wine_prefix in config["path_map"].items():
+        if linux_path.startswith(linux_prefix):
+            relative = linux_path[len(linux_prefix):]
+            wine_path = wine_prefix + relative.replace("/", "\\")
+            return wine_path
+    raise ValueError(f"No path mapping found for: {linux_path}")
 ```
 
-**systemd unit file** (`/etc/systemd/system/mik-watcher.service`):
+The config `path_map` must be set correctly by the user (see [Section 8](#8-configuration-configjson)).
+
+---
+
+## 4. FilePathHash: Algorithm Discovery
+
+The `Song.FilePathHash` column is indexed and used for deduplication. The algorithm is **not documented** by MIK. The README confirms it is a hex string but does not give its length.
+
+### Verification Script
+
+Run this **once** against your existing DB to identify the algorithm before first use:
+
+```python
+#!/usr/bin/env python3
+"""
+mik_identify_hash.py
+Run once to identify the FilePathHash algorithm used by MIK.
+Usage: python mik_identify_hash.py /path/to/MIKStore.db
+"""
+import sqlite3, hashlib, sys
+from urllib.parse import unquote
+
+CANDIDATES = [
+    ("md5",    lambda s: hashlib.md5(s).hexdigest()),
+    ("sha1",   lambda s: hashlib.sha1(s).hexdigest()),
+    ("sha256", lambda s: hashlib.sha256(s).hexdigest()),
+    ("sha512", lambda s: hashlib.sha512(s).hexdigest()),
+]
+
+ENCODINGS = ["utf-8", "utf-16-le", "utf-16-be"]
+CASES = ["asis", "lower", "upper"]
+
+def normalize(path: str) -> str:
+    # Strip file:// prefix, decode percent-encoding
+    if path.lower().startswith("file:///"):
+        path = path[8:]
+    return unquote(path)
+
+def try_all(path: str, known_hash: str):
+    norm = normalize(path)
+    variants = [
+        norm,
+        norm.lower(),
+        norm.upper(),
+        norm.replace("/", "\\"),
+        norm.replace("/", "\\").lower(),
+        norm.replace("/", "\\").upper(),
+    ]
+    for variant in variants:
+        for enc in ENCODINGS:
+            raw = variant.encode(enc, errors="replace")
+            for name, fn in CANDIDATES:
+                result = fn(raw)
+                if result.lower() == known_hash.lower():
+                    return name, enc, variant[:60]
+    return None
+
+def main():
+    db_path = sys.argv[1]
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute(
+        "SELECT File, FilePathHash FROM Song WHERE FilePathHash IS NOT NULL LIMIT 20"
+    ).fetchall()
+    conn.close()
+
+    for row in rows:
+        result = try_all(row["File"], row["FilePathHash"])
+        if result:
+            algo, enc, variant = result
+            print(f"MATCH FOUND: {algo.upper()} / {enc}")
+            print(f"  Path variant: {variant}")
+            print(f"  Known hash:   {row['FilePathHash']}")
+            return
+    print("No match found. FilePathHash may use a custom algorithm.")
+    print("Sample path:", rows[0]["File"] if rows else "(no rows)")
+    print("Sample hash:", rows[0]["FilePathHash"] if rows else "(no rows)")
+    print(f"Sample hash length: {len(rows[0]['FilePathHash']) if rows else 0} chars")
+
+if __name__ == "__main__":
+    main()
+```
+
+### Best Guess (before running verification)
+
+MIK 11 is a .NET 6+ application. The most common approach in modern .NET for a deterministic, non-security hex hash used for deduplication is **SHA256 of UTF-8 encoded path**. The path is likely stored in its original Windows backslash form.
+
+Default implementation used in `mik_queue_insert.py` until verified:
+
+```python
+import hashlib
+
+def compute_file_path_hash(wine_path: str) -> str:
+    """Best-guess: SHA256 of UTF-8 encoded Windows path."""
+    return hashlib.sha256(wine_path.encode("utf-8")).hexdigest()
+```
+
+**If `mik_identify_hash.py` reveals a different algorithm, update the function above accordingly.**  
+The config file supports a `hash_algo` key to override this at runtime without code changes.
+
+---
+
+## 5. Component: mik_queue_insert.py
+
+This is the core injection script. It takes one or more audio file paths, builds the `Song` row, and inserts it into MIK's DB.
+
+```python
+#!/usr/bin/env python3
+"""
+mik_queue_insert.py
+
+Injects one or more audio files into MIK's SQLite DB as unanalyzed tracks.
+MIK will pick them up and analyze on next startup.
+
+Usage:
+    python mik_queue_insert.py /mnt/music/track.mp3
+    python mik_queue_insert.py /mnt/music/*.flac
+    python mik_queue_insert.py --batch /path/to/filelist.txt
+    python mik_queue_insert.py --dry-run /mnt/music/track.mp3
+
+Requires:
+    pip install mutagen
+    config.json in same directory (see MIK_AUTOMATION_PLAN.md Section 8)
+"""
+
+import argparse
+import hashlib
+import json
+import os
+import shutil
+import sqlite3
+import sys
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Optional
+
+try:
+    from mutagen import File as MutagenFile
+    from mutagen.id3 import ID3NoHeaderError
+except ImportError:
+    print("ERROR: mutagen is required. Run: pip install mutagen")
+    sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
+DEFAULT_CONFIG_PATH = Path(__file__).parent.parent / "data" / "automation_config.json"
+
+def load_config(path: Path = DEFAULT_CONFIG_PATH) -> dict:
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Config not found: {path}\n"
+            f"Create it from template: data/automation_config.example.json"
+        )
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+# ---------------------------------------------------------------------------
+# Path translation
+# ---------------------------------------------------------------------------
+
+def linux_to_wine_path(linux_path: str, config: dict) -> str:
+    """
+    Translate a Linux absolute path to the Windows path MIK uses.
+    Uses config["path_map"] which is a dict of {linux_prefix: wine_prefix}.
+    """
+    for linux_prefix, wine_prefix in config["path_map"].items():
+        if linux_path.startswith(linux_prefix):
+            relative = linux_path[len(linux_prefix):]
+            wine_path = wine_prefix.rstrip("\\") + "\\" + relative.lstrip("/").replace("/", "\\")
+            return wine_path
+    raise ValueError(
+        f"No path mapping for: {linux_path}\n"
+        f"Add it to 'path_map' in config.json"
+    )
+
+
+# ---------------------------------------------------------------------------
+# FilePathHash
+# ---------------------------------------------------------------------------
+
+def compute_file_path_hash(wine_path: str, algo: str = "sha256") -> str:
+    """
+    Compute FilePathHash as MIK would.
+    Default: SHA256 of UTF-8 encoded Windows path.
+    Run mik_identify_hash.py to verify the correct algorithm.
+    Override via config["hash_algo"].
+    """
+    data = wine_path.encode("utf-8")
+    if algo == "sha256":
+        return hashlib.sha256(data).hexdigest()
+    elif algo == "md5":
+        return hashlib.md5(data).hexdigest()
+    elif algo == "sha1":
+        return hashlib.sha1(data).hexdigest()
+    elif algo == "sha256_lower":
+        return hashlib.sha256(wine_path.lower().encode("utf-8")).hexdigest()
+    elif algo == "md5_lower":
+        return hashlib.md5(wine_path.lower().encode("utf-8")).hexdigest()
+    else:
+        raise ValueError(f"Unknown hash_algo: {algo}")
+
+
+# ---------------------------------------------------------------------------
+# Metadata extraction
+# ---------------------------------------------------------------------------
+
+def read_audio_metadata(linux_path: str) -> dict:
+    """Extract metadata from audio file using mutagen."""
+    meta = {
+        "artist": "",
+        "title": "",
+        "album": "",
+        "genre": "",
+        "year": 0,
+        "label": "",
+        "remixer": "",
+        "composer": "",
+        "grouping": "",
+        "bpm": None,
+        "bitrate": 0,
+        "sample_rate": 44100,
+        "filesize": os.path.getsize(linux_path),
+    }
+    try:
+        audio = MutagenFile(linux_path, easy=True)
+        if audio is None:
+            return meta
+        if hasattr(audio, "info"):
+            info = audio.info
+            meta["bitrate"] = int(getattr(info, "bitrate", 0) / 1000)
+            meta["sample_rate"] = getattr(info, "sample_rate", 44100)
+        def get(key):
+            val = audio.get(key)
+            if val:
+                return str(val[0]).strip()
+            return ""
+        meta["artist"] = get("artist")
+        meta["title"] = get("title")
+        meta["album"] = get("album")
+        meta["genre"] = get("genre")
+        meta["label"] = get("organization") or get("label")
+        meta["remixer"] = get("remixer") or get("tp1")
+        meta["composer"] = get("composer")
+        meta["grouping"] = get("grouping")
+        bpm_str = get("bpm")
+        if bpm_str:
+            try:
+                meta["bpm"] = float(bpm_str)
+            except ValueError:
+                pass
+        year_str = get("date")
+        if year_str:
+            try:
+                meta["year"] = int(year_str[:4])
+            except (ValueError, IndexError):
+                pass
+    except Exception as e:
+        print(f"  [WARN] Could not read metadata from {linux_path}: {e}")
+    return meta
+
+
+# ---------------------------------------------------------------------------
+# DB helpers
+# ---------------------------------------------------------------------------
+
+def db_connect(db_path: Path) -> sqlite3.Connection:
+    conn = sqlite3.connect(str(db_path), timeout=30)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")  # safer for concurrent access
+    conn.execute("PRAGMA foreign_keys=ON")
+    return conn
+
+
+def song_exists(conn: sqlite3.Connection, file_path_hash: str) -> Optional[str]:
+    """Return existing Song.Id if a song with this FilePathHash already exists."""
+    row = conn.execute(
+        "SELECT Id FROM Song WHERE FilePathHash = ?", (file_path_hash,)
+    ).fetchone()
+    return row["Id"] if row else None
+
+
+def get_mik_root_collection_id(conn: sqlite3.Connection) -> str:
+    """Get the UUID of the MIKRoot collection (main MIK library)."""
+    row = conn.execute(
+        "SELECT Id FROM Collection WHERE Name = 'MIKRoot' AND IsLibrary = 1"
+    ).fetchone()
+    if not row:
+        raise RuntimeError(
+            "MIKRoot collection not found in DB. "
+            "Has MIK 11 been launched at least once on this Wine prefix?"
+        )
+    return row["Id"]
+
+
+def get_disk_info(linux_path: str, config: dict) -> tuple:
+    """
+    Return (DiskIsRemovable, DiskLabel, DiskSerialNumber).
+    Uses config values if set, otherwise tries to detect from mount.
+    """
+    disk_label = config.get("disk_label", "")
+    disk_serial = config.get("disk_serial", "")
+    disk_removable = config.get("disk_removable", 0)
+    return disk_removable, disk_label, disk_serial
+
+
+def insert_song(conn: sqlite3.Connection, wine_path: str, linux_path: str,
+                file_path_hash: str, meta: dict, config: dict) -> str:
+    """INSERT a new Song row with IsAnalyzed=0. Returns the new Song UUID."""
+    now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+    song_id = str(uuid.uuid4())
+    ext = Path(linux_path).suffix.lower()
+    disk_removable, disk_label, disk_serial = get_disk_info(linux_path, config)
+
+    conn.execute("""
+        INSERT INTO Song (
+            Id, File, FilePathHash,
+            ArtistName, SongName, Album, Genre, Year,
+            Label, Remixer, Composer, Grouping,
+            Tempo, OverallVolume, OverallEnergy, EnergySegmentsCount,
+            StandardPitch,
+            KeyResultSummary, MainKey, MainKeyConfidence,
+            SecondKey, SecondKeyConfidence,
+            IsAnalyzed,
+            Comment,
+            DateAdded, LastModifiedUtc, LastAnalyzedUtc,
+            ClippedPeaksCount,
+            HasPNTag, PNTagIsProcessed, PNTagAppliedClipRepair,
+            PNTagVolumeAnalysisVersion, PNTagVolumeUnits, PNTagOutputVolume,
+            OverallVolumeRMS1, OverallVolumeRMS2, OverallVolumeLUFS,
+            DiskIsRemovable, DiskLabel, DiskSerialNumber,
+            FileType, FileSize, Bitrate, SampleRate,
+            Rating
+        ) VALUES (
+            ?, ?, ?,
+            ?, ?, ?, ?, ?,
+            ?, ?, ?, ?,
+            ?, 0.0, 0, 0,
+            0.0,
+            NULL, NULL, 0.0,
+            '-1A', 0.0,
+            0,
+            '',
+            ?, ?, NULL,
+            0,
+            0, 0, 0,
+            0, '', 0.0,
+            0.0, 0.0, 0.0,
+            ?, ?, ?,
+            ?, ?, ?, ?,
+            0
+        )
+    """, (
+        song_id, wine_path, file_path_hash,
+        meta["artist"], meta["title"], meta["album"], meta["genre"], meta["year"],
+        meta["label"], meta["remixer"], meta["composer"], meta["grouping"],
+        meta["bpm"],
+        now_utc, now_utc,
+        disk_removable, disk_label, disk_serial,
+        ext, meta["filesize"], meta["bitrate"], meta["sample_rate"],
+    ))
+    return song_id
+
+
+def insert_collection_membership(conn: sqlite3.Connection, song_id: str,
+                                  collection_id: str) -> None:
+    """Add track to MIKRoot collection."""
+    # Get current max Sequence in this collection
+    row = conn.execute(
+        "SELECT COALESCE(MAX(Sequence), 0) as max_seq FROM SongCollectionMembership "
+        "WHERE CollectionId = ?", (collection_id,)
+    ).fetchone()
+    next_seq = row["max_seq"] + 1
+
+    membership_id = str(uuid.uuid4())
+    conn.execute("""
+        INSERT INTO SongCollectionMembership (Id, SongId, CollectionId, Sequence)
+        VALUES (?, ?, ?, ?)
+    """, (membership_id, song_id, collection_id, next_seq))
+
+
+# ---------------------------------------------------------------------------
+# Main queue function
+# ---------------------------------------------------------------------------
+
+AUDIO_EXTENSIONS = {".mp3", ".flac", ".m4a", ".wav", ".aiff", ".aif", ".mp4", ".ogg"}
+
+
+def queue_file(linux_path: str, config: dict, dry_run: bool = False,
+               backup: bool = True) -> bool:
+    """
+    Queue a single audio file for MIK analysis.
+    Returns True if inserted, False if skipped (already exists).
+    """
+    linux_path = str(Path(linux_path).resolve())
+
+    ext = Path(linux_path).suffix.lower()
+    if ext not in AUDIO_EXTENSIONS:
+        print(f"  [SKIP] Not an audio file: {linux_path}")
+        return False
+
+    if not os.path.exists(linux_path):
+        print(f"  [SKIP] File not found: {linux_path}")
+        return False
+
+    # Translate path
+    wine_path = linux_to_wine_path(linux_path, config)
+    hash_algo = config.get("hash_algo", "sha256")
+    file_path_hash = compute_file_path_hash(wine_path, hash_algo)
+
+    db_path = Path(config["db_path"]).expanduser()
+    if not db_path.exists():
+        raise FileNotFoundError(f"MIK DB not found: {db_path}")
+
+    if dry_run:
+        print(f"  [DRY RUN] Would queue: {linux_path}")
+        print(f"            Wine path:  {wine_path}")
+        print(f"            Hash:       {file_path_hash}")
+        return True
+
+    # Backup DB before first modification in this session
+    if backup and not getattr(queue_file, "_backed_up", False):
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup_path = db_path.with_suffix(f".backup_{ts}")
+        shutil.copy2(db_path, backup_path)
+        print(f"  [BACKUP] {backup_path}")
+        queue_file._backed_up = True
+
+    conn = db_connect(db_path)
+    try:
+        # Dedup check
+        existing_id = song_exists(conn, file_path_hash)
+        if existing_id:
+            print(f"  [EXISTS] Already in DB (id={existing_id}): {linux_path}")
+            return False
+
+        collection_id = get_mik_root_collection_id(conn)
+        meta = read_audio_metadata(linux_path)
+
+        conn.execute("BEGIN")
+        try:
+            song_id = insert_song(conn, wine_path, linux_path,
+                                   file_path_hash, meta, config)
+            insert_collection_membership(conn, song_id, collection_id)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+
+        print(f"  [QUEUED] {linux_path}")
+        print(f"           → {wine_path}")
+        print(f"           id={song_id}")
+        return True
+
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# CLI entry point
+# ---------------------------------------------------------------------------
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="Queue audio files for MIK analysis via SQLite injection."
+    )
+    ap.add_argument("files", nargs="*", help="Audio file paths to queue.")
+    ap.add_argument("--batch", help="Text file with one path per line.")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="Preview what would be inserted, no DB changes.")
+    ap.add_argument("--no-backup", action="store_true",
+                    help="Skip automatic DB backup before first write.")
+    ap.add_argument("--config", default=None,
+                    help="Path to config JSON (default: data/automation_config.json).")
+    args = ap.parse_args()
+
+    config_path = Path(args.config) if args.config else DEFAULT_CONFIG_PATH
+    config = load_config(config_path)
+
+    files = list(args.files)
+    if args.batch:
+        with open(args.batch, "r", encoding="utf-8") as f:
+            files += [line.strip() for line in f if line.strip()]
+
+    if not files:
+        ap.print_help()
+        sys.exit(1)
+
+    inserted = 0
+    skipped = 0
+    for fp in files:
+        try:
+            result = queue_file(fp, config,
+                                dry_run=args.dry_run,
+                                backup=not args.no_backup)
+            if result:
+                inserted += 1
+            else:
+                skipped += 1
+        except Exception as e:
+            print(f"  [ERROR] {fp}: {e}")
+            skipped += 1
+
+    print(f"\nDone: {inserted} queued, {skipped} skipped/errors.")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+---
+
+## 6. Component: mik_watcher_daemon.py
+
+This daemon watches the music directory and calls `mik_queue_insert.py` automatically.
+
+```python
+#!/usr/bin/env python3
+"""
+mik_watcher_daemon.py
+
+Watches MUSIC_DIR for new audio files and queues them into MIK's DB.
+Sends a restart signal to mik_process_manager after each batch.
+
+Run as systemd service (see MIK_AUTOMATION_PLAN.md Section 9).
+
+Usage:
+    python mik_watcher_daemon.py
+    python mik_watcher_daemon.py --config /path/to/config.json
+"""
+
+import argparse
+import logging
+import os
+import signal
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+
+try:
+    from watchdog.observers import Observer
+    from watchdog.events import FileSystemEventHandler, FileCreatedEvent, FileMovedEvent
+except ImportError:
+    print("ERROR: watchdog is required. Run: pip install watchdog")
+    sys.exit(1)
+
+sys.path.insert(0, str(Path(__file__).parent))
+from mik_queue_insert import queue_file, load_config
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+log = logging.getLogger("mik-watcher")
+
+AUDIO_EXTENSIONS = {".mp3", ".flac", ".m4a", ".wav", ".aiff", ".aif"}
+
+
+class MIKEventHandler(FileSystemEventHandler):
+    """
+    Handles file creation events. Uses a debounce timer to batch
+    multiple rapid file additions (e.g., rsync of 100 files) into
+    a single MIK restart rather than 100 restarts.
+    """
+
+    def __init__(self, config: dict, debounce_seconds: float = 30.0):
+        super().__init__()
+        self.config = config
+        self.debounce_seconds = debounce_seconds
+        self._pending: list = []
+        self._timer: threading.Timer = None
+        self._lock = threading.Lock()
+
+    def on_created(self, event):
+        if event.is_directory:
+            return
+        self._handle_path(event.src_path)
+
+    def on_moved(self, event):
+        if event.is_directory:
+            return
+        self._handle_path(event.dest_path)
+
+    def _handle_path(self, path: str):
+        if Path(path).suffix.lower() not in AUDIO_EXTENSIONS:
+            return
+        log.info(f"New file detected: {path}")
+        with self._lock:
+            self._pending.append(path)
+            if self._timer is not None:
+                self._timer.cancel()
+            self._timer = threading.Timer(
+                self.debounce_seconds, self._flush
+            )
+            self._timer.start()
+
+    def _flush(self):
+        with self._lock:
+            files = list(self._pending)
+            self._pending.clear()
+            self._timer = None
+
+        if not files:
+            return
+
+        log.info(f"Processing batch of {len(files)} file(s)...")
+        inserted = 0
+        for fp in files:
+            try:
+                # Brief wait: ensure file is fully written before reading metadata
+                time.sleep(1)
+                if queue_file(fp, self.config, dry_run=False, backup=True):
+                    inserted += 1
+            except Exception as e:
+                log.error(f"Failed to queue {fp}: {e}")
+
+        if inserted > 0:
+            log.info(f"Queued {inserted} track(s). Signaling MIK restart...")
+            _signal_mik_restart(self.config)
+        else:
+            log.info("No new tracks to queue (all duplicates or errors).")
+
+
+def _signal_mik_restart(config: dict):
+    """
+    Signal the MIK process manager to restart MIK.
+    Writes a flag file that mik_process_manager.py watches.
+    """
+    flag_path = Path(config.get("restart_flag_path",
+                                "/tmp/mik_restart_requested"))
+    flag_path.touch()
+    log.info(f"Restart flag written: {flag_path}")
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Watch music dir and queue new files into MIK.")
+    ap.add_argument("--config", default=None)
+    args = ap.parse_args()
+
+    config_path = Path(args.config) if args.config else (
+        Path(__file__).parent.parent / "data" / "automation_config.json"
+    )
+    config = load_config(config_path)
+
+    music_dir = config["music_dir"]
+    debounce = config.get("debounce_seconds", 30.0)
+
+    log.info(f"Starting MIK watcher. Watching: {music_dir}")
+    log.info(f"Debounce: {debounce}s")
+
+    handler = MIKEventHandler(config, debounce_seconds=debounce)
+    observer = Observer()
+    observer.schedule(handler, music_dir, recursive=True)
+    observer.start()
+
+    try:
+        while True:
+            time.sleep(5)
+            if not observer.is_alive():
+                log.error("Observer died, restarting...")
+                observer.start()
+    except KeyboardInterrupt:
+        log.info("Shutting down.")
+    finally:
+        observer.stop()
+        observer.join()
+
+
+if __name__ == "__main__":
+    main()
+```
+
+---
+
+## 7. Component: mik_process_manager.py
+
+Manages the Wine + MIK process lifecycle: graceful shutdown, Xvfb setup, restart, and completion detection.
+
+```python
+#!/usr/bin/env python3
+"""
+mik_process_manager.py
+
+Manages the MIK Wine process:
+- Watches for restart_flag_path flag file
+- Gracefully stops MIK
+- Restarts MIK under Wine + Xvfb
+- Monitors until all IsAnalyzed=0 rows are gone (analysis complete)
+- Optionally keeps MIK running continuously
+
+Usage:
+    python mik_process_manager.py            # Run as daemon
+    python mik_process_manager.py --restart  # One-shot restart now
+    python mik_process_manager.py --status   # Show current MIK Wine status
+"""
+
+import argparse
+import logging
+import os
+import signal
+import sqlite3
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent))
+from mik_queue_insert import load_config
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+log = logging.getLogger("mik-process-manager")
+
+
+# ---------------------------------------------------------------------------
+# Xvfb management
+# ---------------------------------------------------------------------------
+
+def ensure_xvfb(display: str = ":99") -> bool:
+    """
+    Ensure a virtual framebuffer is running on the given DISPLAY.
+    Returns True if Xvfb is running (started or was already running).
+    """
+    result = subprocess.run(
+        ["pgrep", "-f", f"Xvfb {display}"],
+        capture_output=True
+    )
+    if result.returncode == 0:
+        log.info(f"Xvfb already running on {display}")
+        return True
+
+    log.info(f"Starting Xvfb on {display}...")
+    subprocess.Popen(
+        ["Xvfb", display, "-screen", "0", "1024x768x24"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL
+    )
+    time.sleep(2)  # Give Xvfb time to start
+
+    result = subprocess.run(
+        ["pgrep", "-f", f"Xvfb {display}"],
+        capture_output=True
+    )
+    if result.returncode != 0:
+        log.error("Failed to start Xvfb. Is it installed? apt install xvfb")
+        return False
+    log.info(f"Xvfb started on {display}")
+    return True
+
+
+# ---------------------------------------------------------------------------
+# MIK Wine process management
+# ---------------------------------------------------------------------------
+
+def find_mik_pids() -> list:
+    """Return PIDs of running MIK Wine processes."""
+    result = subprocess.run(
+        ["pgrep", "-f", "Mixed In Key"],
+        capture_output=True, text=True
+    )
+    if result.returncode != 0:
+        return []
+    return [int(pid.strip()) for pid in result.stdout.strip().split("\n") if pid.strip()]
+
+
+def stop_mik(timeout: int = 30) -> bool:
+    """
+    Gracefully stop MIK. Sends SIGTERM, waits, then SIGKILL if needed.
+    Also runs wineserver -k to clean up Wine state.
+    Returns True if stopped cleanly.
+    """
+    pids = find_mik_pids()
+    if not pids:
+        log.info("MIK not running.")
+        return True
+
+    log.info(f"Stopping MIK (PIDs: {pids})...")
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+
+    for i in range(timeout):
+        time.sleep(1)
+        if not find_mik_pids():
+            log.info(f"MIK stopped cleanly after {i+1}s.")
+            break
+    else:
+        log.warning("MIK did not stop on SIGTERM, sending SIGKILL...")
+        for pid in find_mik_pids():
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+    # Clean up Wine server state
+    log.info("Cleaning up Wine server...")
+    subprocess.run(["wineserver", "-k"], capture_output=True)
+    time.sleep(3)
+    log.info("Wine server stopped.")
+    return True
+
+
+def start_mik(config: dict) -> subprocess.Popen:
+    """
+    Start MIK under Wine with a virtual display.
+    Returns the Popen object for the Wine process.
+    """
+    display = config.get("wine_display", ":99")
+    wine_exe = config.get("wine_executable", "wine")
+    mik_exe = config.get("mik_windows_exe_path",
+                          "C:\\Program Files\\Mixed In Key\\Mixed In Key 11\\Mixed In Key.exe")
+    wine_prefix = config.get("wine_prefix", os.path.expanduser("~/.wine"))
+
+    env = os.environ.copy()
+    env["DISPLAY"] = display
+    env["WINEPREFIX"] = wine_prefix
+    env["WINEDEBUG"] = "-all"  # Suppress Wine debug spam
+
+    log.info(f"Starting MIK: {wine_exe} '{mik_exe}' on DISPLAY={display}")
+    proc = subprocess.Popen(
+        [wine_exe, mik_exe],
+        env=env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL
+    )
+    log.info(f"MIK process started (PID: {proc.pid})")
+    return proc
+
+
+# ---------------------------------------------------------------------------
+# Analysis completion detection
+# ---------------------------------------------------------------------------
+
+def count_pending(db_path: Path) -> int:
+    """Count rows in Song with IsAnalyzed=0."""
+    try:
+        conn = sqlite3.connect(str(db_path), timeout=10)
+        row = conn.execute(
+            "SELECT COUNT(*) as c FROM Song WHERE IsAnalyzed = 0"
+        ).fetchone()
+        conn.close()
+        return row[0]
+    except Exception:
+        return -1
+
+
+def wait_for_analysis_complete(db_path: Path, poll_interval: int = 60,
+                                timeout_minutes: int = 240) -> bool:
+    """
+    Poll the DB until all IsAnalyzed=0 rows are gone.
+    Returns True if complete, False if timed out.
+    """
+    log.info("Waiting for MIK to complete analysis...")
+    start = time.time()
+    timeout_seconds = timeout_minutes * 60
+
+    while True:
+        pending = count_pending(db_path)
+        elapsed = int(time.time() - start)
+        log.info(f"  Pending tracks: {pending} (elapsed: {elapsed}s)")
+
+        if pending == 0:
+            log.info("All tracks analyzed!")
+            return True
+
+        if elapsed > timeout_seconds:
+            log.warning(f"Timed out after {timeout_minutes} min. {pending} tracks still pending.")
+            return False
+
+        time.sleep(poll_interval)
+
+
+# ---------------------------------------------------------------------------
+# Restart routine
+# ---------------------------------------------------------------------------
+
+def do_restart(config: dict):
+    """Full restart cycle: stop → start → wait for completion."""
+    display = config.get("wine_display", ":99")
+    db_path = Path(config["db_path"]).expanduser()
+
+    pending_before = count_pending(db_path)
+    if pending_before == 0:
+        log.info("No pending tracks. Restart skipped.")
+        return
+
+    log.info(f"Starting restart cycle. Pending tracks: {pending_before}")
+
+    stop_mik()
+    ensure_xvfb(display)
+    start_mik(config)
+
+    # Give MIK time to load and start the analysis queue
+    startup_wait = config.get("mik_startup_wait_seconds", 15)
+    log.info(f"Waiting {startup_wait}s for MIK to initialize...")
+    time.sleep(startup_wait)
+
+    wait_for_analysis_complete(
+        db_path,
+        poll_interval=config.get("poll_interval_seconds", 60),
+        timeout_minutes=config.get("analysis_timeout_minutes", 240)
+    )
+
+
+# ---------------------------------------------------------------------------
+# Daemon loop
+# ---------------------------------------------------------------------------
+
+def daemon_loop(config: dict):
+    """Watch for restart flag and trigger restarts."""
+    flag_path = Path(config.get("restart_flag_path", "/tmp/mik_restart_requested"))
+    poll_seconds = config.get("manager_poll_seconds", 10)
+
+    log.info(f"MIK process manager running. Watching: {flag_path}")
+
+    # Start MIK immediately if there are pending tracks
+    db_path = Path(config["db_path"]).expanduser()
+    if count_pending(db_path) > 0:
+        log.info("Found pending tracks on startup. Triggering immediate restart.")
+        do_restart(config)
+
+    while True:
+        try:
+            if flag_path.exists():
+                flag_path.unlink()
+                log.info("Restart flag detected. Initiating restart cycle.")
+                do_restart(config)
+        except Exception as e:
+            log.error(f"Error in daemon loop: {e}")
+        time.sleep(poll_seconds)
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def main():
+    ap = argparse.ArgumentParser(description="Manage MIK Wine process.")
+    ap.add_argument("--restart", action="store_true",
+                    help="Perform one-shot restart now.")
+    ap.add_argument("--stop", action="store_true",
+                    help="Stop MIK and exit.")
+    ap.add_argument("--status", action="store_true",
+                    help="Show MIK process status and pending count.")
+    ap.add_argument("--config", default=None)
+    args = ap.parse_args()
+
+    config_path = Path(args.config) if args.config else (
+        Path(__file__).parent.parent / "data" / "automation_config.json"
+    )
+    config = load_config(config_path)
+
+    if args.status:
+        pids = find_mik_pids()
+        db_path = Path(config["db_path"]).expanduser()
+        pending = count_pending(db_path)
+        print(f"MIK PIDs: {pids if pids else 'not running'}")
+        print(f"Pending tracks (IsAnalyzed=0): {pending}")
+        return
+
+    if args.stop:
+        stop_mik()
+        return
+
+    if args.restart:
+        do_restart(config)
+        return
+
+    # Default: daemon mode
+    daemon_loop(config)
+
+
+if __name__ == "__main__":
+    main()
+```
+
+---
+
+## 8. Configuration: config.json
+
+Save as `data/automation_config.json`. **This file is gitignored** (contains local paths).
+
+A template is provided at `data/automation_config.example.json`:
+
+```json
+{
+  "_comment": "MIK Automation Config — edit paths for your setup",
+
+  "db_path": "~/.wine/drive_c/users/liu/AppData/Local/Mixed In Key/Mixed In Key/11.0/MIKStore.db",
+
+  "music_dir": "/mnt/music",
+
+  "path_map": {
+    "/mnt/music": "H:\\music"
+  },
+
+  "hash_algo": "sha256",
+
+  "disk_label": "",
+  "disk_serial": "",
+  "disk_removable": 0,
+
+  "wine_display": ":99",
+  "wine_executable": "wine",
+  "wine_prefix": "~/.wine",
+  "mik_windows_exe_path": "C:\\Program Files\\Mixed In Key\\Mixed In Key 11\\Mixed In Key.exe",
+
+  "restart_flag_path": "/tmp/mik_restart_requested",
+  "debounce_seconds": 30,
+  "mik_startup_wait_seconds": 15,
+  "poll_interval_seconds": 60,
+  "analysis_timeout_minutes": 240,
+  "manager_poll_seconds": 10
+}
+```
+
+### Key Config Fields
+
+| Field | Description |
+|---|---|
+| `db_path` | Path to `MIKStore.db` in Wine prefix. Use `~` for home dir. |
+| `music_dir` | Linux path to watch for new audio files. |
+| `path_map` | Dict mapping Linux path prefix → Windows path prefix. Must match what MIK sees. |
+| `hash_algo` | Hash algorithm for FilePathHash. Run `mik_identify_hash.py` to verify. Options: `sha256`, `sha256_lower`, `md5`, `md5_lower`, `sha1` |
+| `disk_label` | Volume label of your music disk (check with `lsblk -o LABEL`). Can be empty. |
+| `disk_serial` | Serial number of music disk (check with `lsblk -o SERIAL`). Can be empty. |
+| `wine_prefix` | Path to Wine prefix directory. Default: `~/.wine`. |
+| `mik_windows_exe_path` | Windows path to `Mixed In Key.exe` inside Wine. |
+| `debounce_seconds` | Wait this long after last file event before triggering restart. Batches rapid file additions. |
+| `analysis_timeout_minutes` | Give up waiting for analysis after this many minutes. |
+
+---
+
+## 9. Systemd Service Files
+
+Create two services: the file watcher and the process manager.
+
+### `/etc/systemd/system/mik-watcher.service`
 
 ```ini
 [Unit]
-Description=MIK Queue Watcher
+Description=MIK File Watcher — queues new audio files for analysis
 After=network.target
+Wants=mik-process-manager.service
 
 [Service]
-ExecStart=/usr/bin/python3 /opt/basedline/mik_watcher.py
+Type=simple
+User=liu
+WorkingDirectory=/home/liu/Basedline
+ExecStart=/usr/bin/python3 /home/liu/Basedline/MixedinKey/mik_watcher_daemon.py
 Restart=always
-RestartSec=5
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=mik-watcher
 
 [Install]
 WantedBy=multi-user.target
 ```
 
----
+### `/etc/systemd/system/mik-process-manager.service`
 
-### 3.2 Queue File Writer (Raspi)
+```ini
+[Unit]
+Description=MIK Process Manager — controls Wine/MIK lifecycle
+After=network.target
 
-The queue file is a plain UTF-8 text file, one Linux file path per line:
+[Service]
+Type=simple
+User=liu
+WorkingDirectory=/home/liu/Basedline
+ExecStart=/usr/bin/python3 /home/liu/Basedline/MixedinKey/mik_process_manager.py
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=mik-process-manager
+Environment=WINEPREFIX=/home/liu/.wine
+Environment=DISPLAY=:99
 
-```
-/mnt/music/scdl-mp3/Artist - Track.mp3
-/mnt/music/downloads/Another Track.flac
-```
-
-**Location**: A shared folder accessible from both Raspi and Windows. Example: `/mnt/shared/mik_queue.txt` on Raspi = `\\RASPI\shared\mik_queue.txt` on Windows.
-
-**Atomicity**: Always append-only from the Raspi side. The Windows injector atomically reads and clears it (rename trick — see §3.3).
-
----
-
-### 3.3 DB Queue Injector (Windows) — `mik_queue_inject.py`
-
-**This is the central script.** Runs on Windows via Task Scheduler every 5 minutes (or triggered manually).
-
-**Full spec:**
-
-```python
-#!/usr/bin/env python3
-"""
-mik_queue_inject.py
-Reads mik_queue.txt, injects new tracks into MIKStore.db as IsAnalyzed=0.
-Designed to run on Windows via Task Scheduler.
-"""
-import sqlite3, uuid, os, shutil
-from datetime import datetime, timezone
-from pathlib import Path
-from mutagen import File as MutagenFile
-from mik_config import load_config  # see §12
-
-def main():
-    cfg = load_config()
-    db_path = Path(cfg['mik_db_path'])          # MIKStore.db
-    queue_path = Path(cfg['queue_file_path'])    # \\RASPI\shared\mik_queue.txt
-    linux_prefix = cfg['linux_path_prefix']      # /mnt/music
-    windows_prefix = cfg['windows_path_prefix']  # H:\music
-
-    if not queue_path.exists() or queue_path.stat().st_size == 0:
-        return  # nothing to do
-
-    # Atomic queue read: rename queue to a work copy, then clear original
-    work_queue = queue_path.with_suffix('.processing')
-    os.replace(queue_path, work_queue)
-
-    linux_paths = [p.strip() for p in work_queue.read_text('utf-8').splitlines() if p.strip()]
-    work_queue.unlink()
-
-    if not linux_paths:
-        return
-
-    # Backup DB before modifying
-    ts = datetime.now().strftime('%Y%m%d_%H%M%S')
-    backup_path = db_path.with_suffix(f'.db.backup_{ts}')
-    shutil.copy2(db_path, backup_path)
-
-    conn = sqlite3.connect(str(db_path))
-    conn.row_factory = sqlite3.Row
-
-    # Get MIKRoot collection ID
-    mik_root_id = conn.execute(
-        "SELECT Id FROM Collection WHERE Name='MIKRoot'"
-    ).fetchone()['Id']
-
-    # Get disk info from existing rows (to populate DiskLabel/DiskSerialNumber)
-    disk_info = get_disk_info(conn, windows_prefix)
-
-    injected, skipped, failed = [], [], []
-
-    try:
-        conn.execute("BEGIN")
-        for linux_path in linux_paths:
-            win_path = translate_path(linux_path, linux_prefix, windows_prefix)
-            try:
-                result = inject_track(conn, win_path, mik_root_id, disk_info)
-                if result == 'injected':
-                    injected.append(win_path)
-                else:
-                    skipped.append(win_path)  # already in DB
-            except Exception as e:
-                failed.append((win_path, str(e)))
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
-
-    # Log results
-    log_results(injected, skipped, failed, cfg.get('log_path'))
-
-    # Optionally restart MIK if tracks were injected
-    if injected and cfg.get('auto_restart_mik', False):
-        restart_mik(cfg.get('mik_exe_path'))
+[Install]
+WantedBy=multi-user.target
 ```
 
-**The inject_track function:**
-
-```python
-def inject_track(conn, win_path: str, mik_root_id: str, disk_info: dict) -> str:
-    """
-    Returns 'injected' if new row was created, 'skipped' if already exists.
-    """
-    # Dedup check: query by File path (safe fallback if FilePathHash unknown)
-    existing = conn.execute(
-        "SELECT Id FROM Song WHERE File = ?", (win_path,)
-    ).fetchone()
-    if existing:
-        return 'skipped'
-
-    # Also check by FilePathHash once algorithm is known (see §5)
-    file_hash = compute_file_path_hash(win_path)  # returns hex string
-    if file_hash:
-        existing_by_hash = conn.execute(
-            "SELECT Id FROM Song WHERE FilePathHash = ?", (file_hash,)
-        ).fetchone()
-        if existing_by_hash:
-            return 'skipped'
-
-    # Read file metadata
-    meta = read_metadata(win_path)
-
-    now_utc = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
-    song_id = str(uuid.uuid4())
-
-    conn.execute("""
-        INSERT INTO Song (
-            Id, File, FilePathHash,
-            ArtistName, SongName, Album, Genre, Grouping, Year,
-            Label, Remixer, Composer,
-            Comment, Tempo, OverallEnergy, EnergySegmentsCount,
-            OverallVolume, StandardPitch,
-            MainKey, MainKeyConfidence,
-            SecondKey, SecondKeyConfidence,
-            KeyResultSummary,
-            IsAnalyzed,
-            HasPNTag, PNTagIsProcessed, PNTagAppliedClipRepair,
-            PNTagVolumeAnalysisVersion, PNTagVolumeUnits, PNTagOutputVolume,
-            ClippedPeaksCount,
-            OverallVolumeRMS1, OverallVolumeRMS2, OverallVolumeLUFS,
-            DiskIsRemovable, DiskLabel, DiskSerialNumber,
-            FileType, FileSize, Bitrate, SampleRate, Rating,
-            DateAdded, LastModifiedUtc, LastAnalyzedUtc,
-            Artwork
-        ) VALUES (
-            ?,?,?,  ?,?,?,?,?,?,  ?,?,?,
-            ?,?,?,?,  ?,?,  ?,?,  ?,?,  ?,
-            ?,
-            ?,?,?,  ?,?,?,  ?,
-            ?,?,?,  ?,?,?,  ?,?,?,?,?,
-            ?,?,?,  ?
-        )
-    """, (
-        song_id, win_path, file_hash or '',
-        meta['artist'], meta['title'], meta['album'], meta['genre'], '', meta['year'],
-        '', '', '',
-        '',                      # Comment: leave empty, MIK will write its own
-        meta['bpm'], 0, 0,       # Tempo, OverallEnergy, EnergySegmentsCount
-        0.0, 0.0,                # OverallVolume, StandardPitch (deprecated)
-        '', 0.0,                 # MainKey, MainKeyConfidence (empty = not analyzed)
-        '-1A', 0.0,              # SecondKey sentinel, SecondKeyConfidence
-        '',                      # KeyResultSummary
-        0,                       # IsAnalyzed = 0  ← KEY FLAG
-        0, 0, 0,                 # PN flags
-        0, '', 0.0,              # PN version/units/volume
-        0,                       # ClippedPeaksCount
-        0.0, 0.0, 0.0,           # RMS1, RMS2, LUFS
-        0,                       # DiskIsRemovable
-        disk_info.get('label', ''), disk_info.get('serial', ''),
-        meta['ext'],             # FileType e.g. '.mp3'
-        meta['size'],            # FileSize bytes
-        meta['bitrate'],         # Bitrate kbps
-        meta['samplerate'],      # SampleRate Hz
-        0,                       # Rating
-        now_utc, now_utc, None,  # DateAdded, LastModifiedUtc, LastAnalyzedUtc=NULL
-        meta.get('artwork'),     # Artwork BLOB or None
-    ))
-
-    # Add to MIKRoot collection
-    membership_id = str(uuid.uuid4())
-    max_seq = conn.execute(
-        "SELECT COALESCE(MAX(Sequence), 0) FROM SongCollectionMembership WHERE CollectionId = ?",
-        (mik_root_id,)
-    ).fetchone()[0]
-    conn.execute(
-        "INSERT INTO SongCollectionMembership (Id, SongId, CollectionId, Sequence) VALUES (?,?,?,?)",
-        (membership_id, song_id, mik_root_id, max_seq + 1)
-    )
-
-    return 'injected'
-```
-
-**read_metadata helper** (using mutagen):
-
-```python
-def read_metadata(win_path: str) -> dict:
-    defaults = {
-        'artist': '', 'title': os.path.splitext(os.path.basename(win_path))[0],
-        'album': '', 'genre': '', 'year': 0,
-        'bpm': 0.0, 'bitrate': 0, 'samplerate': 44100,
-        'ext': os.path.splitext(win_path)[1].lower(),
-        'size': os.path.getsize(win_path) if os.path.exists(win_path) else 0,
-        'artwork': None,
-    }
-    try:
-        audio = MutagenFile(win_path, easy=False)
-        if audio is None:
-            return defaults
-        info = getattr(audio, 'info', None)
-        if info:
-            defaults['bitrate'] = int(getattr(info, 'bitrate', 0) / 1000)
-            defaults['samplerate'] = getattr(info, 'sample_rate', 44100)
-        # Tag extraction varies by format — use EasyID3 wrapper or direct access
-        # ... (implementation differs per format, use mutagen's tag objects)
-    except Exception:
-        pass
-    return defaults
-```
-
----
-
-### 3.4 MIK Restart Trigger (Windows)
-
-After injecting new tracks, MIK needs to (re)load the DB to pick up `IsAnalyzed=0` rows.
-
-**Option A — Auto restart (add to `mik_queue_inject.py`):**
-
-```python
-import subprocess, time
-
-def restart_mik(mik_exe_path: str):
-    """Kill MIK if running, then relaunch it."""
-    subprocess.run(['taskkill', '/IM', 'Mixed In Key.exe', '/F'],
-                   capture_output=True)
-    time.sleep(2)
-    subprocess.Popen([mik_exe_path])
-```
-
-Default MIK exe path: `C:\Program Files\Mixed In Key\Mixed In Key.exe`  
-(Configurable in settings — see §12.)
-
-**Option B — Manual / semi-automatic:**  
-Leave `auto_restart_mik = false` in config. Script injects silently. User restarts MIK manually when convenient. Best for users who run MIK only occasionally.
-
-**Option C — Windows Task Scheduler only:**  
-Schedule `mik_queue_inject.py` to run every 5 minutes. Also schedule a separate task that starts MIK at a fixed time (e.g., 3am) and kills it 30 minutes later after analysis completes.
-
-**Recommended**: Option A with `auto_restart_mik = true` for fully hands-free operation.
-
----
-
-### 3.5 Post-Analysis Tag Writeback — `mik_writeback_tags.py`
-
-After MIK analyzes a track, the results live in the DB. This script reads them back and writes standard ID3/FLAC tags to the audio files — so other software (Rekordbox, Serato, beets, etc.) can see the MIK key.
-
-**Can run on either Windows or Raspi** (Raspi preferred — it has direct file access and Python).
-
-```python
-#!/usr/bin/env python3
-"""
-mik_writeback_tags.py
-Polls MIKStore.db for newly analyzed tracks and writes key/BPM/energy to file tags.
-Maintains a state file (last_writeback.txt) with the last processed LastAnalyzedUtc.
-"""
-import sqlite3
-from pathlib import Path
-from datetime import datetime, timezone
-from mutagen.id3 import ID3, TXXX, TBPM, COMM
-from mutagen.flac import FLAC
-from mutagen.mp4 import MP4
-from mik_config import load_config
-
-def main():
-    cfg = load_config()
-    db_path = cfg['mik_db_path']       # can be local or SMB-mounted path
-    state_file = Path(cfg.get('writeback_state_file', 'last_writeback.txt'))
-    linux_prefix = cfg['linux_path_prefix']
-    windows_prefix = cfg['windows_path_prefix']
-
-    last_run = '1970-01-01T00:00:00.000Z'
-    if state_file.exists():
-        last_run = state_file.read_text().strip()
-
-    conn = sqlite3.connect(f'file:{db_path}?mode=ro', uri=True)  # READ-ONLY
-    conn.row_factory = sqlite3.Row
-
-    rows = conn.execute("""
-        SELECT File, MainKey, Tempo, OverallEnergy, Comment, LastAnalyzedUtc
-        FROM Song
-        WHERE IsAnalyzed = 1
-          AND LastAnalyzedUtc > ?
-          AND MainKey != ''
-          AND MainKey != '0A'
-        ORDER BY LastAnalyzedUtc ASC
-    """, (last_run,)).fetchall()
-
-    conn.close()
-
-    newest_ts = last_run
-    for row in rows:
-        linux_path = translate_path_reverse(
-            row['File'], linux_prefix, windows_prefix
-        )
-        try:
-            write_tags(linux_path, row['MainKey'], row['Tempo'], row['OverallEnergy'])
-            print(f"Tagged: {linux_path} → {row['MainKey']} {row['Tempo']:.1f}bpm")
-        except Exception as e:
-            print(f"WARN: Failed to tag {linux_path}: {e}")
-        newest_ts = row['LastAnalyzedUtc']
-
-    if newest_ts != last_run:
-        state_file.write_text(newest_ts)
-
-def write_tags(path: str, key: str, bpm: float, energy: int):
-    ext = Path(path).suffix.lower()
-    if ext == '.mp3':
-        tags = ID3(path)
-        tags['TXXX:KEY'] = TXXX(encoding=3, desc='KEY', text=key)
-        tags['TBPM'] = TBPM(encoding=3, text=str(int(round(bpm))))
-        tags['TXXX:Energy'] = TXXX(encoding=3, desc='Energy', text=str(energy))
-        # Also write to standard KEY frame (used by Rekordbox/Serato):
-        from mutagen.id3 import TKEY
-        tags['TKEY'] = TKEY(encoding=3, text=camelot_to_openkey(key))
-        tags.save()
-    elif ext == '.flac':
-        tags = FLAC(path)
-        tags['KEY'] = key
-        tags['BPM'] = str(int(round(bpm)))
-        tags['ENERGY'] = str(energy)
-        tags.save()
-    elif ext in ('.m4a', '.mp4'):
-        tags = MP4(path)
-        tags['----:com.apple.iTunes:KEY'] = key.encode()
-        tags['tmpo'] = [int(round(bpm))]
-        tags.save()
-```
-
-**Camelot → Open Key conversion** (for TKEY frame compatibility with Rekordbox):
-
-```python
-CAMELOT_TO_OPENKEY = {
-    '1A': 'Am', '2A': 'Em', '3A': 'Bm', '4A': 'F#m', '5A': 'Dbm', '6A': 'Abm',
-    '7A': 'Ebm', '8A': 'Bbm', '9A': 'Fm', '10A': 'Cm', '11A': 'Gm', '12A': 'Dm',
-    '1B': 'C',  '2B': 'G',  '3B': 'D',  '4B': 'A',  '5B': 'E',  '6B': 'B',
-    '7B': 'F#', '8B': 'Db', '9B': 'Ab', '10B': 'Eb', '11B': 'Bb', '12B': 'F',
-}
-
-def camelot_to_openkey(camelot: str) -> str:
-    return CAMELOT_TO_OPENKEY.get(camelot, camelot)
-```
-
----
-
-## 4. Minimal Viable INSERT Statement
-
-Based on the documented schema, this is the absolute minimum INSERT that should cause MIK to detect and analyze a track. All other columns will be populated by MIK during analysis.
-
-```sql
-INSERT INTO Song (
-    Id,
-    File,
-    FilePathHash,
-    IsAnalyzed,
-    SecondKey,
-    SecondKeyConfidence,
-    DateAdded,
-    LastModifiedUtc,
-    OverallVolume,
-    StandardPitch,
-    OverallEnergy,
-    EnergySegmentsCount,
-    ClippedPeaksCount,
-    MainKeyConfidence,
-    Tempo,
-    OverallVolumeRMS1,
-    OverallVolumeRMS2,
-    OverallVolumeLUFS,
-    DiskIsRemovable,
-    HasPNTag,
-    PNTagIsProcessed,
-    PNTagAppliedClipRepair,
-    PNTagVolumeAnalysisVersion,
-    PNTagOutputVolume,
-    Rating
-) VALUES (
-    'NEW-UUID-HERE',
-    'H:\music\Artist - Track.mp3',
-    '',                       -- FilePathHash: leave empty until algo known; see §5
-    0,                        -- IsAnalyzed = 0 ← THE KEY FLAG
-    '-1A',                    -- SecondKey sentinel (always this value)
-    0.0,
-    '2026-03-08T03:00:00.000Z',
-    '2026-03-08T03:00:00.000Z',
-    0.0, 0.0,                 -- OverallVolume, StandardPitch (deprecated)
-    0, 0, 0,                  -- OverallEnergy, EnergySegmentsCount, ClippedPeaksCount
-    0.0,                      -- MainKeyConfidence
-    0.0,                      -- Tempo
-    0.0, 0.0, 0.0,            -- RMS1, RMS2, LUFS
-    0,                        -- DiskIsRemovable
-    0, 0, 0, 0, 0.0,          -- PN flags
-    0                         -- Rating
-);
-```
-
-**Constraint notes** (from `WITHOUT ROWID` behavior):
-- `Id` is the clustering key — must be unique
-- No explicit `NOT NULL` constraints observed on most columns, but SQLite `WITHOUT ROWID` tables require the PK to be NOT NULL
-- `SecondKey = '-1A'` must be present to match MIK's internal invariant — leaving it NULL may cause display issues
-
----
-
-## 5. FilePathHash Reverse Engineering
-
-The `FilePathHash` column is indexed (`IX_Song_FilePathHash`) and used for dedup. The algorithm is not documented. This section describes how to determine it empirically.
-
-### Step 1: Extract known path→hash pairs
-
-```python
-import sqlite3
-conn = sqlite3.connect(r'C:\Users\...\MIKStore.db')
-rows = conn.execute("SELECT File, FilePathHash FROM Song LIMIT 20").fetchall()
-for file, hash_val in rows:
-    print(repr(file), '→', hash_val)
-```
-
-### Step 2: Test candidate algorithms
-
-```python
-import hashlib
-
-def test_hash_algos(path: str, expected_hash: str):
-    candidates = {
-        'md5_utf8_lower':    hashlib.md5(path.lower().encode('utf-8')).hexdigest(),
-        'md5_utf8_orig':     hashlib.md5(path.encode('utf-8')).hexdigest(),
-        'sha1_utf8_lower':   hashlib.sha1(path.lower().encode('utf-8')).hexdigest(),
-        'sha1_utf8_orig':    hashlib.sha1(path.encode('utf-8')).hexdigest(),
-        'sha256_utf8_lower': hashlib.sha256(path.lower().encode('utf-8')).hexdigest(),
-        'sha256_utf8_orig':  hashlib.sha256(path.encode('utf-8')).hexdigest(),
-        'md5_utf16le':       hashlib.md5(path.lower().encode('utf-16-le')).hexdigest(),
-        'sha1_utf16le':      hashlib.sha1(path.lower().encode('utf-16-le')).hexdigest(),
-    }
-    for name, result in candidates.items():
-        if result == expected_hash.lower():
-            print(f"✅ MATCH: {name}")
-            return name
-    print("❌ No match — may be a non-standard hash or includes salt")
-    return None
-```
-
-### Best guess (pre-testing)
-
-Based on .NET/C# conventions and the fact MIK stores it as a hex string, **MD5 of the lowercase UTF-8 path** is the most likely candidate:
-
-```python
-import hashlib
-def compute_file_path_hash(win_path: str) -> str:
-    return hashlib.md5(win_path.lower().encode('utf-8')).hexdigest()
-```
-
-### Fallback strategy
-
-If the hash algorithm cannot be determined, the dedup check in `inject_track` still works via direct `File` path comparison. Insert `FilePathHash = ''` (empty string). MIK will likely recompute/overwrite it during analysis. The index will be slightly less efficient but correctness is maintained.
-
----
-
-## 6. Path Translation (Linux/Raspi ↔ Windows)
-
-The Raspi and Windows machine see the same audio files at different paths. A bidirectional translation function is required.
-
-```python
-def translate_path(linux_path: str, linux_prefix: str, windows_prefix: str) -> str:
-    """Convert Raspi path to Windows path for DB insertion."""
-    if not linux_path.startswith(linux_prefix):
-        raise ValueError(f"Path {linux_path!r} does not start with {linux_prefix!r}")
-    relative = linux_path[len(linux_prefix):]
-    # Convert forward slashes to backslashes
-    relative_win = relative.replace('/', '\\')
-    # Strip leading separator if present
-    relative_win = relative_win.lstrip('\\')
-    return windows_prefix.rstrip('\\') + '\\' + relative_win
-
-def translate_path_reverse(win_path: str, linux_prefix: str, windows_prefix: str) -> str:
-    """Convert Windows DB path back to Raspi path for tag writing."""
-    if not win_path.lower().startswith(windows_prefix.lower()):
-        raise ValueError(f"Windows path {win_path!r} does not start with {windows_prefix!r}")
-    relative = win_path[len(windows_prefix):]
-    relative_linux = relative.replace('\\', '/')
-    relative_linux = relative_linux.lstrip('/')
-    return linux_prefix.rstrip('/') + '/' + relative_linux
-```
-
-**Example config values:**
-```json
-{
-  "linux_path_prefix": "/mnt/music",
-  "windows_path_prefix": "H:\\music"
-}
-```
-
----
-
-## 7. DB Access Strategy & Concurrency Safety
-
-### Option A: Queue File (Recommended)
-
-- **Raspi writes**: `/mnt/shared/mik_queue.txt` (plain text, append-only)
-- **Windows reads + DB writes**: `mik_queue_inject.py` runs locally on Windows
-- **Conflict risk**: Near zero — DB is only modified by one process at a time
-
-### Option B: Direct SMB Mount (Alternative, higher risk)
-
-Mount the MIK DB directory on the Raspi:
+### Enable and start
 
 ```bash
-sudo mount -t cifs //windows-pc/Users/Liu/AppData/Local/Mixed\ In\ Key/Mixed\ In\ Key/11.0 \
-  /mnt/mik -o username=Liu,vers=3.0
-```
+sudo systemctl daemon-reload
+sudo systemctl enable mik-watcher mik-process-manager
+sudo systemctl start mik-watcher mik-process-manager
 
-Then run `mik_queue_inject.py` on the Raspi directly. **Risks:**
-- SQLite WAL mode may not work correctly over SMB
-- MIK running simultaneously can cause `SQLITE_BUSY` or corruption
-- Recommended mitigation: only inject when MIK is not running (check process via `tasklist` or port)
+# Check status
+sudo systemctl status mik-watcher
+sudo systemctl status mik-process-manager
 
-### Concurrency Guard (for either approach)
-
-```python
-import sqlite3
-
-def safe_connect(db_path: str, timeout: float = 30.0) -> sqlite3.Connection:
-    """Connect with busy timeout to handle concurrent access."""
-    conn = sqlite3.connect(db_path, timeout=timeout)
-    conn.execute("PRAGMA journal_mode=WAL")   # safer for concurrent readers
-    conn.execute("PRAGMA synchronous=NORMAL")  # balance safety/speed
-    return conn
+# Follow logs
+journalctl -u mik-watcher -f
+journalctl -u mik-process-manager -f
 ```
 
 ---
 
-## 8. SongCollectionMembership Handling
+## 10. Testing Procedure
 
-For an injected track to appear in MIK's main library (not just exist silently in the DB), it likely needs a `SongCollectionMembership` row linking it to the `MIKRoot` collection.
+Follow this step-by-step to validate the system before going live.
 
-```python
-def add_to_mik_root(conn, song_id: str, mik_root_id: str):
-    membership_id = str(uuid.uuid4())
-    # Get next sequence number
-    row = conn.execute(
-        "SELECT COALESCE(MAX(Sequence), 0) as max_seq FROM SongCollectionMembership WHERE CollectionId = ?",
-        (mik_root_id,)
-    ).fetchone()
-    next_seq = row['max_seq'] + 1
-    conn.execute(
-        "INSERT INTO SongCollectionMembership (Id, SongId, CollectionId, Sequence) VALUES (?,?,?,?)",
-        (membership_id, song_id, mik_root_id, next_seq)
-    )
+### Step 1: Verify FilePathHash algorithm
+
+```bash
+# From the repo root
+python3 MixedinKey/mik_identify_hash.py ~/.wine/drive_c/users/liu/AppData/Local/"Mixed In Key"/"Mixed In Key"/11.0/MIKStore.db
 ```
 
-**Getting MIKRoot ID** (varies per installation — always query, never hardcode):
-
-```python
-mik_root_id = conn.execute(
-    "SELECT Id FROM Collection WHERE Name='MIKRoot' AND IsLibrary=1"
-).fetchone()['Id']
+Expected output:
+```
+MATCH FOUND: SHA256 / utf-8
+  Path variant: H:\music\something.mp3
+  Known hash:   a3f2...
 ```
 
-**Open question**: Does MIK still pick up and analyze `IsAnalyzed=0` rows that are NOT in any collection? If so, the `SongCollectionMembership` INSERT is optional for triggering analysis, but still needed for the track to appear in MIK's UI. Recommended: always insert both.
+If algo is not `sha256`, update `hash_algo` in `automation_config.json`.
 
----
+### Step 2: Dry-run a single file
 
-## 9. Implementation Order
-
-Implement in this exact order to allow incremental testing at each stage:
-
-| Step | Script | Platform | Test |
-|------|--------|----------|------|
-| 1 | `MixedinKey/mik_hash_test.py` | Windows | Run against existing DB rows to identify `FilePathHash` algorithm |
-| 2 | `MixedinKey/mik_queue_inject.py` — dry run mode | Windows | Verify SQL is correct, no DB writes |
-| 3 | Manual single-track injection test | Windows | Inject 1 track, open MIK, verify it appears and gets analyzed |
-| 4 | `mik_watcher.py` | Raspi | Verify queue.txt gets populated on file drop |
-| 5 | `mik_queue_inject.py` — live via Task Scheduler | Windows | Full end-to-end: drop file on Raspi, MIK analyzes it |
-| 6 | `mik_writeback_tags.py` | Raspi | Verify tags written to files after MIK analysis |
-| 7 | Systemd service for watcher | Raspi | Persistent background operation |
-
----
-
-## 10. Testing Strategy
-
-### Test 1: Verify IsAnalyzed=0 triggers analysis
-
-1. Inject one row with `IsAnalyzed=0` manually (use dry-run SQL, then apply)
-2. Restart MIK
-3. Observe: does the track appear in MIK's "needs analysis" queue?
-4. After analysis: confirm `IsAnalyzed` changed to `1`, `MainKey` populated
-
-**Expected**: Yes. If No, MIK may require `SongSegment` pre-population.
-
-### Test 2: SongSegment requirement
-
-If Test 1 fails (MIK ignores the injected row), try also inserting a stub `SongSegment` row:
-
-```sql
-INSERT INTO SongSegment (SongSegmentId, StartTime, EndTime, KeyConfidence, Volume, IsSingleNote, KeyResult, SongId)
-VALUES ('NEW-UUID', 0, 0, 0.0, 0.0, 0, '', 'SONG-UUID');
+```bash
+python3 MixedinKey/mik_queue_insert.py --dry-run /mnt/music/test_track.mp3
 ```
 
-### Test 3: Collection membership requirement
+Should print the wine path and hash without touching the DB.
 
-Test whether MIK shows injected tracks without `SongCollectionMembership` row. If yes, membership can be optional.
+### Step 3: Live insert test (DB backup auto-created)
 
-### Test 4: FilePathHash validation
+```bash
+# Backup is auto-created before first write
+python3 MixedinKey/mik_queue_insert.py /mnt/music/test_track.mp3
+```
 
-Run `mik_hash_test.py` — see §5. Confirm matching algorithm.
+Verify in DB:
+```bash
+sqlite3 ~/.wine/drive_c/users/liu/AppData/Local/"Mixed In Key"/"Mixed In Key"/11.0/MIKStore.db \
+  "SELECT Id, File, IsAnalyzed, MainKey FROM Song ORDER BY DateAdded DESC LIMIT 3;"
+```
 
-### Test 5: Path translation round-trip
+Expected: new row with `IsAnalyzed=0`, `MainKey=NULL`.
 
-```python
-linux = '/mnt/music/artist/track.mp3'
-win = translate_path(linux, '/mnt/music', 'H:\\music')
-assert win == 'H:\\music\\artist\\track.mp3'
-assert translate_path_reverse(win, '/mnt/music', 'H:\\music') == linux
+### Step 4: Trigger MIK restart and watch
+
+```bash
+python3 MixedinKey/mik_process_manager.py --restart
+```
+
+Watch logs:
+```bash
+journalctl -u mik-process-manager -f
+```
+
+After MIK finishes, verify:
+```bash
+sqlite3 ... "SELECT File, IsAnalyzed, MainKey, Tempo FROM Song WHERE File LIKE '%test_track%';"
+```
+
+Expected: `IsAnalyzed=1`, `MainKey` has a Camelot value (e.g., `8A`), `Tempo` has BPM.
+
+### Step 5: End-to-end watcher test
+
+```bash
+# Start services
+sudo systemctl start mik-watcher mik-process-manager
+
+# Drop a new file into the watched directory
+cp /tmp/new_track.mp3 /mnt/music/new_track.mp3
+
+# Watch watcher logs
+journalctl -u mik-watcher -f
+# Should see: "New file detected", "Queued 1 track(s)", "Signaling MIK restart"
+
+# After debounce_seconds, watch process manager
+journalctl -u mik-process-manager -f
+# Should see: "Restart flag detected", "Starting MIK", eventually "All tracks analyzed!"
 ```
 
 ---
 
-## 11. Known Unknowns & Risks
+## 11. Batch Backfill: Queuing an Entire Directory
 
-| # | Unknown | Risk if wrong | Resolution |
-|---|---------|--------------|------------|
-| 1 | `FilePathHash` algorithm | Duplicate rows possible if hash mismatch on re-insert; index degraded | Empirical test (§5); fallback: empty string |
-| 2 | MIK re-reads DB on startup vs polling | Analysis may not trigger without restart | Test: inject row while MIK open, wait 30s; if no pickup, restart required |
-| 3 | `SongSegment` required for analysis pickup | Injected tracks silently ignored | Test 2 (§10) |
-| 4 | `SongCollectionMembership` required | Track not visible in MIK UI | Test 3 (§10); always insert to be safe |
-| 5 | MIK DB schema changes in future versions | Scripts break on MIK update | Pin to schema version `11009`; add version check on startup |
-| 6 | SQLite `WITHOUT ROWID` constraints | INSERT fails with cryptic error | Use declared PK always; never `rowid` |
-| 7 | Windows path encoding (Unicode filenames) | Path mismatch for non-ASCII filenames | Always use `utf-8` encoding; test with accented characters |
-| 8 | MIK locks DB file during analysis | `SQLITE_BUSY` during writeback | Use `timeout=30.0` on connect; retry logic |
-| 9 | `DiskLabel`/`DiskSerialNumber` required | Unknown — MIK may use these for portable library features | Query from existing rows for same drive prefix; leave empty as fallback |
+To queue an entire existing music directory that MIK hasn't seen:
+
+```bash
+# Generate file list
+find /mnt/music -type f \( -name '*.mp3' -o -name '*.flac' -o -name '*.m4a' \) \
+  > /tmp/music_filelist.txt
+
+wc -l /tmp/music_filelist.txt  # Check count
+
+# Dry run first
+python3 MixedinKey/mik_queue_insert.py --batch /tmp/music_filelist.txt --dry-run
+
+# Live insert (will create one backup, then batch insert)
+python3 MixedinKey/mik_queue_insert.py --batch /tmp/music_filelist.txt
+```
+
+For very large libraries (100k+ tracks), this will generate a lot of DB inserts. Run it overnight and trigger MIK restart when done:
+
+```bash
+python3 MixedinKey/mik_process_manager.py --restart
+```
+
+MIK's cloud analysis rate may limit throughput. At ~1-5 sec/track, 100k tracks = 28-140 hours of analysis time.
 
 ---
 
-## 12. Config File Schema
+## 12. Known Limitations and Risks
 
-All scripts share one config file at `settings/basedline_settings.json`:
+### ⚠️ FilePathHash mismatch (highest risk)
+If the `hash_algo` in config does not match what MIK actually uses, MIK will **not recognize** injected tracks as duplicates. MIK will create duplicate entries when it later scans the same file via its own UI. **Mitigation:** Always run `mik_identify_hash.py` before first use.
 
-```json
-{
-  "mik_db_path": "C:\\Users\\Liu\\AppData\\Local\\Mixed In Key\\Mixed In Key\\11.0\\MIKStore.db",
-  "queue_file_path": "\\\\RASPI\\shared\\mik_queue.txt",
-  "linux_path_prefix": "/mnt/music",
-  "windows_path_prefix": "H:\\music",
-  "mik_exe_path": "C:\\Program Files\\Mixed In Key\\Mixed In Key.exe",
-  "auto_restart_mik": true,
-  "log_path": "C:\\Users\\Liu\\Documents\\Baseline\\Logs\\mik_inject.log",
-  "writeback_state_file": "/opt/basedline/settings/last_writeback.txt",
-  "write_tkey_frame": true,
-  "write_bpm_tag": true,
-  "write_energy_tag": true,
-  "dry_run": false
-}
-```
+### ⚠️ IsAnalyzed trigger assumption (unverified)
+The assumption that `IsAnalyzed=0` rows are auto-picked-up on MIK startup is based on logical inference from the schema. It has not been empirically verified. **If this assumption is wrong**, the fallback is the diff-based approach (see [Section 13](#13-open-questions-for-liu)).
 
----
+### ⚠️ Wine + ARM (Box64) stability
+Running MIK (Windows x86_64) on Raspberry Pi ARM requires Box64 for binary translation. Performance will be significantly slower than native Windows, and stability is not guaranteed. MIK's network calls (cloud analysis) should not be affected by this, but startup time may be very long. **Mitigation:** Increase `mik_startup_wait_seconds` in config if MIK doesn't have time to initialize.
 
-## 13. Full Data Flow Diagram
+### ⚠️ SQLite concurrent access
+If MIK is running while `mik_queue_insert.py` writes to the DB, there is a risk of write contention. The script uses `PRAGMA journal_mode=WAL` which greatly reduces this risk, but ideally MIK should not be running during batch inserts. The watcher daemon uses a debounce to batch inserts before triggering MIK restart, which naturally separates write phases.
 
-```
-┌──────────────────────────────────────────────────────────────────────┐
-│                        RASPBERRY PI                                   │
-│                                                                       │
-│  new file lands                                                       │
-│  in /mnt/music/   ──→  mik_watcher.py  ──→  append to queue.txt     │
-│                         (inotify/                                     │
-│                          watchdog)                                    │
-│                                              ┌──────────────────┐    │
-│  mik_writeback_tags.py  ←── DB read (RO) ←──┤  SMB or rsync    │    │
-│  writes KEY/BPM/Energy                       │  from Windows    │    │
-│  to audio file tags                          └──────────────────┘    │
-└──────────────────────────────────────────────────────────────────────┘
-         ▲ queue.txt written to SMB share                ▲ DB read back
-         │                                               │
-         ▼                                               │
-┌──────────────────────────────────────────────────────────────────────┐
-│                        WINDOWS MACHINE                                │
-│                                                                       │
-│  Task Scheduler (every 5min)                                          │
-│  mik_queue_inject.py                                                  │
-│  ├── read & clear queue.txt                                           │
-│  ├── translate Linux paths → Windows paths                            │
-│  ├── read file metadata via mutagen                                   │
-│  ├── INSERT into Song (IsAnalyzed=0)                                  │
-│  ├── INSERT into SongCollectionMembership (→ MIKRoot)                 │
-│  └── restart Mixed In Key.exe (if auto_restart_mik=true)             │
-│                    │                                                  │
-│                    ▼                                                  │
-│  Mixed In Key.exe                                                     │
-│  ├── reads MIKStore.db on startup                                     │
-│  ├── detects IsAnalyzed=0 rows                                        │
-│  ├── sends audio to cloud analysis API                                │
-│  └── writes back: MainKey, Tempo, OverallEnergy, Comment,             │
-│       SongSegment, SerializedSongStructure, IsAnalyzed=1              │
-└──────────────────────────────────────────────────────────────────────┘
-```
+### ⚠️ DB schema changes between MIK versions
+The documented schema is for MIK 11 (SchemaVersion 11009). Future MIK updates may change the schema. **Mitigation:** Always backup before writes.
+
+### ⚠️ MIK may re-analyze existing tracks
+If MIK's internal logic re-queues tracks for re-analysis (e.g., when it detects `FilePathHash` collision with different file content), BPM/Key data will be overwritten. This is generally desired behavior but worth noting.
+
+### Cloud analysis requires internet
+MIK only works with an active internet connection. The Raspi must have outbound internet access when MIK is running.
 
 ---
 
-## Appendix: Scripts To Be Created
+## 13. Open Questions for Liu
 
-| File | Platform | Purpose |
-|------|----------|---------|
-| `MixedinKey/mik_queue_inject.py` | Windows | Main injector — reads queue, INSERTs to DB |
-| `MixedinKey/mik_writeback_tags.py` | Raspi | Reads DB post-analysis, writes tags to files |
-| `MixedinKey/mik_hash_test.py` | Windows | Identifies FilePathHash algorithm empirically |
-| `MixedinKey/mik_config.py` | Both | Shared config loader |
-| `mik_watcher.py` (repo root) | Raspi | inotify-based file watcher, populates queue |
-| `mik-watcher.service` | Raspi | systemd unit for persistent watcher |
+These could not be resolved without empirical testing. Best guesses have been implemented, but answers may require config or code changes.
 
-All scripts follow the existing Basedline conventions: dry-run by default, timestamped DB backups before modification, structured logging.
+1. **FilePathHash algorithm** — `mik_identify_hash.py` will answer this definitively. Currently defaulting to SHA256 of UTF-8 Windows path. If wrong, update `hash_algo` in config.
+
+2. **Exact Windows path of MIK EXE in Wine** — config defaults to `C:\Program Files\Mixed In Key\Mixed In Key 11\Mixed In Key.exe`. Check actual path with:
+   ```bash
+   find ~/.wine -name 'Mixed In Key.exe' 2>/dev/null
+   ```
+
+3. **Username inside Wine prefix** — affects DB path. Config defaults use `liu`. Check with:
+   ```bash
+   ls ~/.wine/drive_c/users/
+   ```
+
+4. **Drive letter for music SSD** — config defaults to `H:\`. Check Wine dosdevices:
+   ```bash
+   ls -la ~/.wine/dosdevices/
+   ```
+   If no drive is mapped, create the symlink as shown in [Section 3](#3-path-translation-linux--wine).
+
+5. **IsAnalyzed=0 trigger confirmation** — if MIK does NOT auto-analyze rows on startup, the alternative is GUI automation via `xdotool` to simulate drag-and-drop. This is the fallback plan and can be implemented if needed.
+
+6. **DiskLabel / DiskSerialNumber** — these are stored by MIK when it adds a track. The correct values for the SMB-mounted music SSD are unknown. The script defaults to empty strings, which should be fine — MIK may overwrite these fields when it processes the queued track.
