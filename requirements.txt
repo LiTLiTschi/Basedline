@@ -1,4 +1,5 @@
 mutagen
+watchdog
 Pillow
 requests
 openpyxl
