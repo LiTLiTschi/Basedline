@@ -1,0 +1,9 @@
+# Worktrees
+.worktrees/
+
+# Python
+__pycache__/
+*.pyc
+
+# Config (contains user-specific paths)
+data/automation_config.json
