@@ -337,68 +337,62 @@ All tools: dry-run by default, create timestamped `.backup_*` copies before modi
 
 ---
 
-## 🤖 MIK Automation Plan (Raspberry Pi / Wine / Headless)
+## Windows MIK Automation
 
-This fork includes a fully detailed plan and all implementation scripts for **hands-free, automated Mixed In Key 11 analysis** on a Raspberry Pi running MIK via Wine — **no GUI interaction required at any point**.
+This fork includes scripts for **automated Mixed In Key 11 analysis** on Windows. The pipeline watches a music directory (e.g. a network share) for new audio files, injects them into MIK's database as unanalyzed, and restarts MIK to trigger analysis.
 
-The automation pipeline watches a music directory for new audio files, injects them into `MIKStore.db` with `IsAnalyzed = 0`, and restarts MIK so it picks them up for cloud analysis automatically.
-
-> **Full plan:** [`MixedinKey/MIK_AUTOMATION_PLAN.md`](MixedinKey/MIK_AUTOMATION_PLAN.md)
+MIK writes Key/BPM/Energy tags back into the audio files automatically (when "Write to file tags" is enabled in MIK settings).
 
 ### How It Works
 
 ```
-New file on disk
+New file on disk (e.g. H:\music\track.mp3)
       ↓
-mik_watcher_daemon.py  (watchdog/inotify, debounced)
+mik_watcher.py     (watchdog, debounced, file-stability check)
       ↓
-mik_queue_insert.py    (INSERT into Song with IsAnalyzed=0)
+mik_queue_insert.py (INSERT into Song with IsAnalyzed=0)
       ↓
-mik_process_manager.py (debounced Wine/MIK process restart)
+mik_launcher.py     (restart MIK.exe)
       ↓
-MIK 11 (Wine + Xvfb)   (reads DB, calls cloud API, writes Key/BPM/Energy back)
+MIK 11              (analyzes tracks, writes tags to files)
 ```
 
-### Scripts & Resources
+### Scripts
 
 | File | Description |
 |---|---|
-| [`MixedinKey/MIK_AUTOMATION_PLAN.md`](MixedinKey/MIK_AUTOMATION_PLAN.md) | Full automation plan — architecture, algorithms, config reference, systemd services, testing procedure, known limitations |
-| [`MixedinKey/mik_queue_insert.py`](MixedinKey/mik_queue_insert.py) | Injects one or more audio files into MIK's DB as unanalyzed tracks |
-| [`MixedinKey/mik_watcher_daemon.py`](MixedinKey/mik_watcher_daemon.py) | Watches music directory for new files (inotify via watchdog), triggers queue insert with debounce |
-| [`MixedinKey/mik_process_manager.py`](MixedinKey/mik_process_manager.py) | Manages debounced Wine/MIK process restarts; monitors until queue is drained |
-| [`MixedinKey/mik_identify_hash.py`](MixedinKey/mik_identify_hash.py) | One-time verification script — run against live DB to confirm `FilePathHash` algorithm |
-| [`data/automation_config.example.json`](data/automation_config.example.json) | Config template — copy to `data/automation_config.json` and fill in your paths |
+| [`MixedinKey/mik_queue_insert.py`](MixedinKey/mik_queue_insert.py) | Insert audio files into MIK's DB as unanalyzed tracks |
+| [`MixedinKey/mik_watcher.py`](MixedinKey/mik_watcher.py) | Watch directory for new files, trigger queue insert + MIK restart |
+| [`MixedinKey/mik_launcher.py`](MixedinKey/mik_launcher.py) | Manage MIK.exe process (start/stop/restart/wait) |
+| [`MixedinKey/mik_identify_hash.py`](MixedinKey/mik_identify_hash.py) | One-time script to verify the `FilePathHash` algorithm |
+| [`data/automation_config.example.json`](data/automation_config.example.json) | Config template — copy and fill in your paths |
 
 ### Quick Start
 
 ```bash
 # 1. Copy and fill in config
-cp data/automation_config.example.json data/automation_config.json
-# Edit: db_path, music_dir, path_map (Linux→Wine drive letter), wine_prefix
+copy data\automation_config.example.json data\automation_config.json
+# Edit: db_path, watch_dir, mik_exe_path
 
 # 2. Install dependencies
 pip install mutagen watchdog
 
-# 3. Confirm FilePathHash algorithm (run once against live DB)
-python MixedinKey/mik_identify_hash.py
+# 3. Confirm FilePathHash algorithm (run once against your live DB)
+python MixedinKey\mik_identify_hash.py
 
 # 4. Dry-run a single file
-python MixedinKey/mik_queue_insert.py --dry-run /mnt/music/track.mp3
+python MixedinKey\mik_queue_insert.py --dry-run H:\music\track.mp3
 
 # 5. Live test a single file
-python MixedinKey/mik_queue_insert.py /mnt/music/track.mp3
+python MixedinKey\mik_queue_insert.py H:\music\track.mp3
 
-# 6. Deploy as systemd services (see plan Section 9)
+# 6. Run the watcher (add to Windows Startup for always-on)
+python MixedinKey\mik_watcher.py
 ```
 
-### ⚠️ Before You Run: Critical Unknowns
+### Before You Run
 
-1. **`FilePathHash` algorithm** — The plan uses SHA-256 of the Wine path as best guess, but the actual MIK algorithm is unconfirmed. **Run `mik_identify_hash.py` against your live DB first** — inserting with the wrong hash will cause duplicate rows.
-2. **Wine prefix path** — Confirm your `MIKStore.db` location: `~/.wine/drive_c/users/<username>/AppData/Local/Mixed In Key/Mixed In Key/11.0/MIKStore.db`
-3. **Drive letter mapping** — Confirm which Wine drive letter maps to your music SSD: `ls -la ~/.wine/dosdevices/`
-4. **Xvfb** — Required for headless Wine. Install: `sudo apt install xvfb`
-
-See [Section 13 of the plan](MixedinKey/MIK_AUTOMATION_PLAN.md#13-open-questions-for-liu) for the full list of open questions.
+1. **`FilePathHash` algorithm** — Run `mik_identify_hash.py` against your live DB first. Inserting with the wrong hash causes duplicate rows.
+2. **MIK must have been launched once** — The scripts need the `MIKRoot` collection to exist in the DB.
 
 ---

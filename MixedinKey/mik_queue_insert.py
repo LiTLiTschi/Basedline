@@ -1,26 +1,20 @@
 #!/usr/bin/env python3
 """
-mik_queue_insert.py
+mik_queue_insert.py — Insert audio files into MIKStore.db as unanalyzed tracks.
 
-Injects one or more audio files into MIK's SQLite DB as unanalyzed tracks.
 MIK will pick them up and analyze on next startup.
 
-See: MixedinKey/MIK_AUTOMATION_PLAN.md Section 5
-
 Usage:
-    python mik_queue_insert.py /mnt/music/track.mp3
-    python mik_queue_insert.py /mnt/music/*.flac
-    python mik_queue_insert.py --batch /path/to/filelist.txt
-    python mik_queue_insert.py --dry-run /mnt/music/track.mp3
-
-Requires:
-    pip install mutagen
-    data/automation_config.json (see MIK_AUTOMATION_PLAN.md Section 8)
+    python mik_queue_insert.py H:\\music\\track.mp3
+    python mik_queue_insert.py H:\\music\\*.flac
+    python mik_queue_insert.py --batch filelist.txt
+    python mik_queue_insert.py --dry-run H:\\music\\track.mp3
 """
 
 import argparse
 import hashlib
 import json
+import logging
 import os
 import shutil
 import sqlite3
@@ -36,6 +30,7 @@ except ImportError:
     print("ERROR: mutagen is required. Run: pip install mutagen")
     sys.exit(1)
 
+log = logging.getLogger("mik-queue-insert")
 
 DEFAULT_CONFIG_PATH = Path(__file__).parent.parent / "data" / "automation_config.json"
 
@@ -50,48 +45,38 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> dict:
         return json.load(f)
 
 
-def linux_to_wine_path(linux_path: str, config: dict) -> str:
-    for linux_prefix, wine_prefix in config["path_map"].items():
-        if linux_path.startswith(linux_prefix):
-            relative = linux_path[len(linux_prefix):]
-            wine_path = wine_prefix.rstrip("\\") + "\\" + relative.lstrip("/").replace("/", "\\")
-            return wine_path
-    raise ValueError(f"No path mapping for: {linux_path}. Add to 'path_map' in config.")
+def compute_file_path_hash(file_path: str, algo: str = "sha256",
+                           encoding: str = "utf-8") -> str:
+    # Support lowercase variants (e.g. "sha256_lower", "md5_lower")
+    # which hash the lowercased path. These are candidates tested by
+    # mik_identify_hash.py to discover MIK's actual algorithm.
+    if algo.endswith("_lower"):
+        file_path = file_path.lower()
+        algo = algo[:-6]  # strip "_lower"
+    data = file_path.encode(encoding)
+    h = hashlib.new(algo, data)
+    return h.hexdigest()
 
 
-def compute_file_path_hash(wine_path: str, algo: str = "sha256") -> str:
-    data = wine_path.encode("utf-8")
-    if algo == "sha256":
-        return hashlib.sha256(data).hexdigest()
-    elif algo == "sha256_lower":
-        return hashlib.sha256(wine_path.lower().encode("utf-8")).hexdigest()
-    elif algo == "md5":
-        return hashlib.md5(data).hexdigest()
-    elif algo == "md5_lower":
-        return hashlib.md5(wine_path.lower().encode("utf-8")).hexdigest()
-    elif algo == "sha1":
-        return hashlib.sha1(data).hexdigest()
-    else:
-        raise ValueError(f"Unknown hash_algo: {algo}")
-
-
-def read_audio_metadata(linux_path: str) -> dict:
+def read_audio_metadata(file_path: str) -> dict:
     meta = {
         "artist": "", "title": "", "album": "", "genre": "", "year": 0,
         "label": "", "remixer": "", "composer": "", "grouping": "",
         "bpm": None, "bitrate": 0, "sample_rate": 44100,
-        "filesize": os.path.getsize(linux_path),
+        "filesize": os.path.getsize(file_path),
     }
     try:
-        audio = MutagenFile(linux_path, easy=True)
+        audio = MutagenFile(file_path, easy=True)
         if audio is None:
             return meta
         if hasattr(audio, "info"):
             meta["bitrate"] = int(getattr(audio.info, "bitrate", 0) / 1000)
             meta["sample_rate"] = getattr(audio.info, "sample_rate", 44100)
+
         def get(key):
             val = audio.get(key)
             return str(val[0]).strip() if val else ""
+
         meta["artist"] = get("artist")
         meta["title"] = get("title")
         meta["album"] = get("album")
@@ -113,7 +98,7 @@ def read_audio_metadata(linux_path: str) -> dict:
             except (ValueError, IndexError):
                 pass
     except Exception as e:
-        print(f"  [WARN] Metadata read failed for {linux_path}: {e}")
+        log.warning(f"Metadata read failed for {file_path}: {e}")
     return meta
 
 
@@ -137,18 +122,18 @@ def get_mik_root_collection_id(conn: sqlite3.Connection) -> str:
         "SELECT Id FROM Collection WHERE Name = 'MIKRoot' AND IsLibrary = 1"
     ).fetchone()
     if not row:
-        raise RuntimeError("MIKRoot collection not found. Has MIK been launched at least once?")
+        raise RuntimeError(
+            "MIKRoot collection not found. Has MIK been launched at least once?"
+        )
     return row["Id"]
 
 
-def insert_song(conn: sqlite3.Connection, wine_path: str, linux_path: str,
+def insert_song(conn: sqlite3.Connection, file_path: str,
                 file_path_hash: str, meta: dict, config: dict) -> str:
-    now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+    now_utc = datetime.now(timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
     song_id = str(uuid.uuid4())
-    ext = Path(linux_path).suffix.lower()
-    disk_removable = config.get("disk_removable", 0)
-    disk_label = config.get("disk_label", "")
-    disk_serial = config.get("disk_serial", "")
+    ext = Path(file_path).suffix.lower()
 
     conn.execute("""
         INSERT INTO Song (
@@ -183,91 +168,108 @@ def insert_song(conn: sqlite3.Connection, wine_path: str, linux_path: str,
             ?, ?, ?, ?, 0
         )
     """, (
-        song_id, wine_path, file_path_hash,
-        meta["artist"], meta["title"], meta["album"], meta["genre"], meta["year"],
+        song_id, file_path, file_path_hash,
+        meta["artist"], meta["title"], meta["album"], meta["genre"],
+        meta["year"],
         meta["label"], meta["remixer"], meta["composer"], meta["grouping"],
         meta["bpm"],
         now_utc, now_utc,
-        disk_removable, disk_label, disk_serial,
+        config.get("disk_is_removable", 0),
+        config.get("disk_label", ""),
+        config.get("disk_serial_number", ""),
         ext, meta["filesize"], meta["bitrate"], meta["sample_rate"],
     ))
     return song_id
 
 
 def insert_collection_membership(conn: sqlite3.Connection, song_id: str,
-                                  collection_id: str) -> None:
+                                 collection_id: str) -> None:
     row = conn.execute(
-        "SELECT COALESCE(MAX(Sequence), 0) as m FROM SongCollectionMembership WHERE CollectionId = ?",
+        "SELECT COALESCE(MAX(Sequence), 0) as m "
+        "FROM SongCollectionMembership WHERE CollectionId = ?",
         (collection_id,)
     ).fetchone()
     next_seq = row["m"] + 1
     conn.execute(
-        "INSERT INTO SongCollectionMembership (Id, SongId, CollectionId, Sequence) VALUES (?, ?, ?, ?)",
+        "INSERT INTO SongCollectionMembership "
+        "(Id, SongId, CollectionId, Sequence) VALUES (?, ?, ?, ?)",
         (str(uuid.uuid4()), song_id, collection_id, next_seq)
     )
 
 
-AUDIO_EXTENSIONS = {".mp3", ".flac", ".m4a", ".wav", ".aiff", ".aif", ".mp4", ".ogg"}
+AUDIO_EXTENSIONS = {".mp3", ".flac", ".m4a", ".wav", ".aiff", ".aif",
+                    ".mp4", ".ogg"}
 _backed_up = False
 
 
-def queue_file(linux_path: str, config: dict, dry_run: bool = False,
-               backup: bool = True) -> bool:
+def queue_file(file_path: str, config: dict, dry_run: bool = False,
+               no_backup: bool = False) -> bool:
     global _backed_up
-    linux_path = str(Path(linux_path).resolve())
-    ext = Path(linux_path).suffix.lower()
-    if ext not in AUDIO_EXTENSIONS:
-        print(f"  [SKIP] Not audio: {linux_path}")
+    file_path = str(Path(file_path).resolve())
+    ext = Path(file_path).suffix.lower()
+
+    audio_exts = config.get("audio_extensions", AUDIO_EXTENSIONS)
+    if isinstance(audio_exts, list):
+        audio_exts = set(audio_exts)
+    if ext not in audio_exts:
+        log.info(f"[SKIP] Not audio: {file_path}")
         return False
-    if not os.path.exists(linux_path):
-        print(f"  [SKIP] Not found: {linux_path}")
+    if not os.path.exists(file_path):
+        log.info(f"[SKIP] Not found: {file_path}")
         return False
 
-    wine_path = linux_to_wine_path(linux_path, config)
     hash_algo = config.get("hash_algo", "sha256")
-    file_path_hash = compute_file_path_hash(wine_path, hash_algo)
+    hash_encoding = config.get("hash_encoding", "utf-8")
+    file_path_hash = compute_file_path_hash(file_path, hash_algo,
+                                            hash_encoding)
 
     db_path = Path(config["db_path"]).expanduser()
     if not db_path.exists():
         raise FileNotFoundError(f"DB not found: {db_path}")
 
     if dry_run:
-        print(f"  [DRY RUN] {linux_path}")
-        print(f"            wine: {wine_path}")
-        print(f"            hash: {file_path_hash}")
+        log.info(f"[DRY RUN] {file_path}")
+        log.info(f"          hash: {file_path_hash}")
         return True
 
-    if backup and not _backed_up:
+    if not no_backup and not _backed_up:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         backup_path = db_path.with_suffix(f".backup_{ts}")
         shutil.copy2(db_path, backup_path)
-        print(f"  [BACKUP] {backup_path}")
+        log.info(f"[BACKUP] {backup_path}")
         _backed_up = True
 
     conn = db_connect(db_path)
     try:
         existing = song_exists(conn, file_path_hash)
         if existing:
-            print(f"  [EXISTS] {linux_path} (id={existing})")
+            log.info(f"[EXISTS] {file_path} (id={existing})")
             return False
         collection_id = get_mik_root_collection_id(conn)
-        meta = read_audio_metadata(linux_path)
+        meta = read_audio_metadata(file_path)
         conn.execute("BEGIN")
         try:
-            song_id = insert_song(conn, wine_path, linux_path, file_path_hash, meta, config)
+            song_id = insert_song(conn, file_path, file_path_hash,
+                                  meta, config)
             insert_collection_membership(conn, song_id, collection_id)
             conn.commit()
         except Exception:
             conn.rollback()
             raise
-        print(f"  [QUEUED] {linux_path} → {wine_path} (id={song_id})")
+        log.info(f"[QUEUED] {file_path} (id={song_id})")
         return True
     finally:
         conn.close()
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Queue audio files for MIK analysis.")
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    ap = argparse.ArgumentParser(
+        description="Queue audio files for MIK analysis.")
     ap.add_argument("files", nargs="*")
     ap.add_argument("--batch", help="Text file with one path per line.")
     ap.add_argument("--dry-run", action="store_true")
@@ -290,15 +292,16 @@ def main():
     inserted = skipped = 0
     for fp in files:
         try:
-            if queue_file(fp, config, dry_run=args.dry_run, backup=not args.no_backup):
+            if queue_file(fp, config, dry_run=args.dry_run,
+                          no_backup=args.no_backup):
                 inserted += 1
             else:
                 skipped += 1
         except Exception as e:
-            print(f"  [ERROR] {fp}: {e}")
+            log.error(f"{fp}: {e}")
             skipped += 1
 
-    print(f"\nDone: {inserted} queued, {skipped} skipped/errors.")
+    log.info(f"Done: {inserted} queued, {skipped} skipped/errors.")
 
 
 if __name__ == "__main__":
