@@ -1,0 +1,26 @@
+{
+  "_comment": "MIK Automation Config — copy to automation_config.json and edit for your setup",
+
+  "db_path": "C:\\Users\\<USER>\\AppData\\Local\\Mixed In Key\\Mixed In Key\\11.0\\MIKStore.db",
+
+  "watch_dir": "H:\\music",
+
+  "audio_extensions": [".mp3", ".flac", ".m4a", ".wav", ".aiff", ".aif"],
+
+  "hash_algo": "sha256",
+  "hash_encoding": "utf-8",
+
+  "debounce_seconds": 30,
+
+  "mik_exe_path": "C:\\Program Files\\Mixed In Key\\11\\Mixed In Key.exe",
+  "mik_startup_wait_seconds": 15,
+  "poll_interval_seconds": 60,
+  "analysis_timeout_minutes": 240,
+  "close_mik_when_done": false,
+
+  "disk_is_removable": 0,
+  "disk_label": "",
+  "disk_serial_number": "",
+
+  "log_file": "data/mik_watcher.log"
+}
