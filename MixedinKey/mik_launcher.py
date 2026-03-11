@@ -101,11 +101,13 @@ def count_pending(config: dict) -> int:
     db_path = Path(config["db_path"]).expanduser()
     try:
         conn = sqlite3.connect(str(db_path), timeout=10)
-        c = conn.execute(
-            "SELECT COUNT(*) FROM Song WHERE IsAnalyzed = 0"
-        ).fetchone()[0]
-        conn.close()
-        return c
+        try:
+            c = conn.execute(
+                "SELECT COUNT(*) FROM Song WHERE IsAnalyzed = 0"
+            ).fetchone()[0]
+            return c
+        finally:
+            conn.close()
     except Exception as e:
         log.warning(f"Could not query DB: {e}")
         return -1
