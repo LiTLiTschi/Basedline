@@ -205,7 +205,9 @@ _backed_up = False
 def queue_file(file_path: str, config: dict, dry_run: bool = False,
                no_backup: bool = False) -> bool:
     global _backed_up
-    file_path = str(Path(file_path).resolve())
+    # Use abspath instead of resolve() — resolve() converts mapped drives
+    # (e.g. H:\) to UNC paths (\\server\share\), but MIK stores drive letters.
+    file_path = os.path.abspath(file_path)
     ext = Path(file_path).suffix.lower()
 
     audio_exts = config.get("audio_extensions", AUDIO_EXTENSIONS)

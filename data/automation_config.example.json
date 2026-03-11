@@ -7,7 +7,7 @@
 
   "audio_extensions": [".mp3", ".flac", ".m4a", ".wav", ".aiff", ".aif"],
 
-  "hash_algo": "sha256",
+  "hash_algo": "md5_lower",
   "hash_encoding": "utf-8",
 
   "debounce_seconds": 30,
